@@ -106,6 +106,77 @@ def write_file(filename: str, content: str) -> str:
 
 
 # =============================================================================
+# SKILL INTEGRATION: Allow agents to query Claude Code skills
+# =============================================================================
+
+SKILLS_DIR = Path.home() / ".claude" / "skills"
+ALLOWED_SKILLS = {
+    "postgres-best-practices",
+    "react-best-practices",
+    "web-design-guidelines",
+}
+
+
+@tool("query_skill")
+def query_skill(skill_name: str, query: str) -> str:
+    """
+    Query a Claude Code skill for best practices and guidelines.
+
+    Use this to get expert guidance on specific topics. Available skills:
+    - postgres-best-practices: Database optimization, indexes, queries
+    - react-best-practices: React/Next.js patterns, performance, hooks
+    - web-design-guidelines: UI/UX, accessibility, design systems
+
+    Args:
+        skill_name: One of the available skill names listed above
+        query: What you want to look up (e.g., "index optimization", "React hooks")
+
+    Returns:
+        Relevant guidance from the skill documentation
+    """
+    if skill_name not in ALLOWED_SKILLS:
+        return f"Error: Unknown skill '{skill_name}'. Available: {', '.join(ALLOWED_SKILLS)}"
+
+    skill_path = SKILLS_DIR / skill_name
+
+    if not skill_path.exists():
+        return f"Error: Skill '{skill_name}' not found at {skill_path}"
+
+    # Try to read AGENTS.md first (compiled for agents), then SKILL.md
+    agents_file = skill_path / "AGENTS.md"
+    skill_file = skill_path / "SKILL.md"
+
+    if agents_file.exists():
+        content = agents_file.read_text()
+    elif skill_file.exists():
+        content = skill_file.read_text()
+    else:
+        return f"Error: No readable content in skill '{skill_name}'"
+
+    # Simple keyword search - return matching lines
+    query_lower = query.lower()
+    lines = content.split('\n')
+    relevant = []
+
+    for i, line in enumerate(lines):
+        if query_lower in line.lower():
+            # Include surrounding context (2 lines before/after)
+            start = max(0, i - 2)
+            end = min(len(lines), i + 3)
+            context = '\n'.join(lines[start:end])
+            if context not in relevant:
+                relevant.append(context)
+
+    if relevant:
+        result = f"From {skill_name} (query: '{query}'):\n\n"
+        result += "\n---\n".join(relevant[:5])  # Limit to 5 matches
+        return result
+    else:
+        # Return a summary of the skill if no matches
+        return f"No matches for '{query}' in {skill_name}. Skill contains {len(lines)} lines of guidance on {skill_name.replace('-', ' ')}."
+
+
+# =============================================================================
 # PHASE 2: Provider Status Check
 # =============================================================================
 
@@ -251,8 +322,10 @@ def create_agents():
         goal="Review code for security vulnerabilities, edge cases, and maintainability",
         backstory="""You are a security-focused code reviewer who catches subtle bugs.
         You focus on security vulnerabilities, error handling, and edge cases.
-        You provide specific, actionable feedback with code examples.""",
+        You provide specific, actionable feedback with code examples.
+        Use query_skill to check best practices when reviewing.""",
         llm="anthropic/claude-opus-4-5-20251101",
+        tools=[query_skill],
         verbose=True,
         allow_delegation=False
     )
@@ -263,8 +336,10 @@ def create_agents():
         goal="Review code for performance issues, inefficiencies, and optimization opportunities",
         backstory="""You are a performance-focused code reviewer.
         You identify slow algorithms, memory issues, and optimization opportunities.
-        You suggest concrete performance improvements with benchmarks when possible.""",
+        You suggest concrete performance improvements with benchmarks when possible.
+        Use query_skill to check postgres/react best practices when relevant.""",
         llm=LLM(model="ollama/deepseek-coder-v2:16b", base_url="http://localhost:11434"),
+        tools=[query_skill],
         verbose=True,
         allow_delegation=False
     )
@@ -622,6 +697,11 @@ Examples:
         action="store_true",
         help="Pause for approval between stages (planning, building, review)"
     )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="Skip provider confirmation prompt (continue even if some providers unavailable)"
+    )
 
     args = parser.parse_args()
 
@@ -649,10 +729,13 @@ Examples:
     print_provider_status(status)
 
     if not all(status.values()):
-        response = input("\nContinue anyway? [y/N]: ")
-        if response.lower() != 'y':
-            print("Aborted.")
-            sys.exit(1)
+        if args.yes:
+            print("\n--yes flag: continuing despite missing providers")
+        else:
+            response = input("\nContinue anyway? [y/N]: ")
+            if response.lower() != 'y':
+                print("Aborted.")
+                sys.exit(1)
 
     print(f"\nTask: {task_description}")
     print(f"Workspace: {WORKSPACE_DIR}")
