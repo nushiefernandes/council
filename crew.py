@@ -113,21 +113,37 @@ def check_providers() -> dict[str, bool]:
     """Check which providers are available at startup."""
     status = {}
 
-    # Check Anthropic
-    status["anthropic"] = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    # Check Anthropic - validate key exists and has reasonable length
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    status["anthropic"] = bool(anthropic_key) and len(anthropic_key) > 20
 
-    # Check OpenAI
-    status["openai"] = bool(os.environ.get("OPENAI_API_KEY"))
+    # Check OpenAI - validate key exists and has reasonable length
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    status["openai"] = bool(openai_key) and len(openai_key) > 20
 
-    # Check Ollama
-    try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-        models = [m["name"] for m in resp.json().get("models", [])]
-        status["ollama"] = any("deepseek" in m for m in models)
-    except Exception:
-        status["ollama"] = False
+    # Check Ollama with retry logic
+    status["ollama"] = _check_ollama_with_retry()
 
     return status
+
+
+def _check_ollama_with_retry(retries: int = 2, initial_timeout: float = 2.0) -> bool:
+    """Check Ollama availability with exponential backoff retry."""
+    for attempt in range(retries + 1):
+        timeout = initial_timeout * (2 ** attempt)  # 2s, 4s, 8s
+        try:
+            resp = requests.get("http://localhost:11434/api/tags", timeout=timeout)
+            if resp.status_code == 200:
+                models = [m["name"] for m in resp.json().get("models", [])]
+                return any("deepseek" in m for m in models)
+        except requests.Timeout:
+            pass  # Expected when Ollama is slow/starting
+        except requests.ConnectionError:
+            pass  # Expected when Ollama not running
+        except Exception as e:
+            # Log unexpected errors but don't crash
+            print(f"Warning: Unexpected error checking Ollama: {e}", file=sys.stderr)
+    return False
 
 
 def print_provider_status(status: dict[str, bool]) -> bool:
@@ -167,15 +183,19 @@ def checkpoint(stage: str, summary: str) -> bool:
     print(f"\n{summary[:2000]}")  # Truncate very long summaries
 
     while True:
-        response = input("\n[A]pprove and continue, [R]eject and abort? [A/r]: ").strip().lower()
-        if response in ('', 'a', 'approve', 'yes', 'y'):
-            print("✓ Approved. Continuing to next stage...")
-            return True
-        elif response in ('r', 'reject', 'no', 'n', 'abort'):
-            print("✗ Rejected. Aborting session.")
+        try:
+            response = input("\n[A]pprove and continue, [R]eject and abort? [A/r]: ").strip().lower()
+            if response in ('', 'a', 'approve', 'yes', 'y'):
+                print("✓ Approved. Continuing to next stage...")
+                return True
+            elif response in ('r', 'reject', 'no', 'n', 'abort'):
+                print("✗ Rejected. Aborting session.")
+                sys.exit(0)
+            else:
+                print("Please enter 'A' to approve or 'R' to reject.")
+        except (EOFError, KeyboardInterrupt):
+            print("\n✗ Session interrupted. Aborting.")
             sys.exit(0)
-        else:
-            print("Please enter 'A' to approve or 'R' to reject.")
 
 
 def create_agents():
@@ -382,6 +402,10 @@ Provide specific, actionable feedback with benchmarks or complexity analysis whe
 
 def create_crew(task_description: str):
     """Create and return the crew with dual-perspective agents."""
+    # Validate task description
+    if not task_description or not task_description.strip():
+        raise ValueError("Task description cannot be empty")
+
     architect_claude, architect_deepseek, builder, reviewer_claude, reviewer_deepseek = create_agents()
     tasks = create_tasks(architect_claude, architect_deepseek, builder, reviewer_claude, reviewer_deepseek, task_description)
 

@@ -18,6 +18,8 @@ import sys
 import subprocess
 import shutil
 import tempfile
+import stat
+import threading
 from pathlib import Path
 
 # Add the crew directory to path so we can import from it
@@ -765,6 +767,350 @@ def test_agent_creation():
 
 
 # =============================================================================
+# TEST CATEGORY 6: Checkpoint System
+# =============================================================================
+
+def test_checkpoint_very_long_summary():
+    """Test summary truncation at 2000 chars."""
+    result = TestResult("Checkpoint Long Summary")
+
+    from crew import checkpoint
+    import io
+    from unittest.mock import patch
+
+    long_summary = "A" * 5000
+
+    try:
+        with patch('builtins.input', return_value='a'):
+            with patch('sys.stdout', new_callable=io.StringIO) as mock_stdout:
+                checkpoint("TEST", long_summary)
+                output = mock_stdout.getvalue()
+                # Should truncate to 2000 chars
+                if len(output) < 5000:
+                    return result.pass_("Long summary truncated correctly")
+        return result.fail("Truncation failed")
+    except Exception as e:
+        return result.fail(f"Exception: {e}")
+
+
+def test_checkpoint_eof_handling():
+    """Test Ctrl+D (EOF) at checkpoint."""
+    result = TestResult("Checkpoint EOF")
+
+    from crew import checkpoint
+    from unittest.mock import patch
+
+    with patch('builtins.input', side_effect=EOFError):
+        try:
+            checkpoint("TEST", "summary")
+            return result.fail("Should have handled EOF")
+        except SystemExit:
+            return result.pass_("EOF causes clean exit")
+        except EOFError:
+            return result.warn("EOF not caught - user sees raw error")
+
+
+def test_checkpoint_keyboard_interrupt():
+    """Test Ctrl+C at checkpoint."""
+    result = TestResult("Checkpoint Interrupt")
+
+    from crew import checkpoint
+    from unittest.mock import patch
+
+    with patch('builtins.input', side_effect=KeyboardInterrupt):
+        try:
+            checkpoint("TEST", "summary")
+            return result.fail("Should have handled interrupt")
+        except SystemExit:
+            return result.pass_("Interrupt causes clean exit")
+        except KeyboardInterrupt:
+            return result.warn("Interrupt not caught - ungraceful exit")
+
+
+def test_checkpoint_empty_input():
+    """Test empty input (just Enter) at checkpoint."""
+    result = TestResult("Checkpoint Empty Input")
+
+    from crew import checkpoint
+    from unittest.mock import patch
+
+    try:
+        with patch('builtins.input', return_value=''):
+            ret = checkpoint("TEST", "summary")
+            if ret == True:
+                return result.pass_("Empty input = approve")
+        return result.fail("Empty input not handled")
+    except Exception as e:
+        return result.fail(f"Exception: {e}")
+
+
+def test_checkpoint_invalid_input_loop():
+    """Test invalid input triggers re-prompt."""
+    result = TestResult("Checkpoint Invalid Input")
+
+    from crew import checkpoint
+    from unittest.mock import patch
+
+    inputs = iter(['invalid', 'xyz', 'a'])  # Third is valid
+    try:
+        with patch('builtins.input', side_effect=lambda _: next(inputs)):
+            ret = checkpoint("TEST", "summary")
+            if ret == True:
+                return result.pass_("Invalid inputs loop until valid")
+        return result.fail("Invalid input handling broken")
+    except Exception as e:
+        return result.fail(f"Exception: {e}")
+
+
+# =============================================================================
+# TEST CATEGORY 7: Concurrency
+# =============================================================================
+
+def test_concurrent_write_file():
+    """Test simultaneous writes don't corrupt."""
+    result = TestResult("Concurrent Writes")
+
+    from crew import write_file, WORKSPACE_DIR
+    import threading
+
+    errors = []
+    def writer(n):
+        try:
+            write_file._run(filename=f"concurrent_{n}.txt", content=f"content_{n}")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Cleanup and verify
+    created = 0
+    for i in range(10):
+        f = WORKSPACE_DIR / f"concurrent_{i}.txt"
+        if f.exists():
+            created += 1
+            f.unlink()
+
+    if errors:
+        return result.fail(f"Concurrent writes caused errors: {errors[0]}")
+    if created == 10:
+        return result.pass_("All 10 concurrent writes succeeded")
+    return result.fail(f"Only {created}/10 files created")
+
+
+def test_write_file_atomic():
+    """Test file writes are atomic (no partial content)."""
+    result = TestResult("Atomic Writes")
+
+    from crew import write_file, WORKSPACE_DIR
+    import threading
+
+    content = "X" * 10000
+    errors = []
+
+    def writer():
+        for _ in range(50):
+            try:
+                write_file._run(filename="atomic_test.txt", content=content)
+            except Exception as e:
+                errors.append(e)
+
+    def reader():
+        for _ in range(100):
+            f = WORKSPACE_DIR / "atomic_test.txt"
+            if f.exists():
+                try:
+                    data = f.read_text()
+                    if data and data != content:
+                        errors.append(f"Partial read: {len(data)} chars")
+                except:
+                    pass
+
+    t1 = threading.Thread(target=writer)
+    t2 = threading.Thread(target=reader)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    (WORKSPACE_DIR / "atomic_test.txt").unlink(missing_ok=True)
+
+    if errors:
+        return result.warn(f"Non-atomic behavior: {errors[0]}")
+    return result.pass_("Writes appear atomic")
+
+
+# =============================================================================
+# TEST CATEGORY 8: Error Recovery
+# =============================================================================
+
+def test_api_key_format_validation():
+    """Test API key format is validated (not just existence)."""
+    result = TestResult("API Key Format Validation")
+
+    from crew import check_providers
+
+    real_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    # Test short invalid key
+    os.environ["ANTHROPIC_API_KEY"] = "short"
+    status = check_providers()
+
+    if real_key:
+        os.environ["ANTHROPIC_API_KEY"] = real_key
+    else:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    if not status.get("anthropic"):
+        return result.pass_("Short key rejected")
+    return result.fail("Short invalid key accepted")
+
+
+def test_provider_partial_availability():
+    """Test graceful handling when only some providers available."""
+    result = TestResult("Partial Providers")
+
+    from crew import check_providers
+
+    # Remove one key temporarily
+    real_openai = os.environ.pop("OPENAI_API_KEY", None)
+
+    try:
+        status = check_providers()
+        # Should still work with partial providers
+        if status.get("anthropic") and not status.get("openai"):
+            return result.pass_("Partial availability detected correctly")
+        return result.warn("Unexpected partial state")
+    finally:
+        if real_openai:
+            os.environ["OPENAI_API_KEY"] = real_openai
+
+
+def test_workspace_permission_denied():
+    """Test handling when workspace becomes read-only."""
+    result = TestResult("Permission Denied")
+
+    from crew import write_file, WORKSPACE_DIR
+    import stat
+
+    test_dir = WORKSPACE_DIR / "readonly_test"
+    test_dir.mkdir(exist_ok=True)
+
+    try:
+        # Make read-only
+        test_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
+
+        try:
+            write_file._run(filename="readonly_test/file.txt", content="test")
+            # Restore and cleanup
+            test_dir.chmod(stat.S_IRWXU)
+            shutil.rmtree(test_dir, ignore_errors=True)
+            return result.fail("Should have raised permission error")
+        except PermissionError:
+            test_dir.chmod(stat.S_IRWXU)
+            shutil.rmtree(test_dir, ignore_errors=True)
+            return result.pass_("Permission denied handled")
+        except Exception as e:
+            test_dir.chmod(stat.S_IRWXU)
+            shutil.rmtree(test_dir, ignore_errors=True)
+            return result.pass_(f"Error raised: {type(e).__name__}")
+    except Exception as e:
+        return result.warn(f"Test setup failed: {e}")
+
+
+def test_ollama_retry_behavior():
+    """Test that Ollama check uses retry logic."""
+    result = TestResult("Ollama Retry Logic")
+
+    # We can't easily test actual retries, but we can verify the function exists
+    try:
+        from crew import _check_ollama_with_retry
+        # Function should exist after our fix
+        return result.pass_("Ollama retry function exists")
+    except ImportError:
+        return result.fail("Ollama retry function not found")
+
+
+# =============================================================================
+# TEST CATEGORY 9: CrewAI Integration
+# =============================================================================
+
+def test_create_crew_with_empty_task():
+    """Test crew creation rejects empty task."""
+    result = TestResult("Empty Task Crew")
+
+    from crew import create_crew
+
+    try:
+        crew = create_crew("")
+        return result.fail("Empty task accepted")
+    except (ValueError, SystemExit):
+        return result.pass_("Empty task rejected")
+    except Exception as e:
+        return result.warn(f"Unexpected error: {type(e).__name__}")
+
+
+def test_agent_llm_config():
+    """Verify agents have valid LLM configuration."""
+    result = TestResult("Agent LLM Config")
+
+    from crew import create_agents
+
+    try:
+        agents = create_agents()
+
+        for agent in agents:
+            llm = getattr(agent, 'llm', None)
+            if llm is None:
+                return result.fail(f"Agent {agent.role} has no LLM")
+            # CrewAI wraps LLM strings into LLM objects - just verify it exists
+            # LLM objects are valid (AnthropicCompletion, OpenAICompletion, etc.)
+
+        return result.pass_(f"All {len(agents)} agents have LLM configured")
+    except Exception as e:
+        return result.warn(f"Agent creation error: {e}")
+
+
+def test_review_result_model():
+    """Test ReviewResult Pydantic model with edge cases."""
+    result = TestResult("ReviewResult Model")
+
+    from crew import Issue, ReviewResult
+
+    try:
+        # Empty issues list
+        review1 = ReviewResult(issues=[], approved=True, summary="")
+
+        # Many issues
+        issues = [
+            Issue(severity="critical", file=f"file{i}.py", description=f"Issue {i}", suggestion="Fix it")
+            for i in range(100)
+        ]
+        review2 = ReviewResult(issues=issues, approved=False, summary="x" * 10000)
+
+        return result.pass_("ReviewResult handles edge cases")
+    except Exception as e:
+        return result.fail(f"Model validation error: {e}")
+
+
+def test_write_file_tool_metadata():
+    """Verify write_file tool has proper metadata."""
+    result = TestResult("Tool Metadata")
+
+    from crew import write_file
+
+    # Check tool has name and description
+    if hasattr(write_file, 'name') or hasattr(write_file, '_run'):
+        if hasattr(write_file, 'description') or write_file.__doc__:
+            return result.pass_("Tool has proper metadata")
+
+    return result.warn("Tool metadata incomplete")
+
+
+# =============================================================================
 # MAIN TEST RUNNER
 # =============================================================================
 
@@ -819,6 +1165,29 @@ def main():
             test_tool_decorator,
             test_pydantic_models,
             test_agent_creation,
+        ],
+        "6. Checkpoint System": [
+            test_checkpoint_very_long_summary,
+            test_checkpoint_eof_handling,
+            test_checkpoint_keyboard_interrupt,
+            test_checkpoint_empty_input,
+            test_checkpoint_invalid_input_loop,
+        ],
+        "7. Concurrency": [
+            test_concurrent_write_file,
+            test_write_file_atomic,
+        ],
+        "8. Error Recovery": [
+            test_api_key_format_validation,
+            test_provider_partial_availability,
+            test_workspace_permission_denied,
+            test_ollama_retry_behavior,
+        ],
+        "9. CrewAI Integration": [
+            test_create_crew_with_empty_task,
+            test_agent_llm_config,
+            test_review_result_model,
+            test_write_file_tool_metadata,
         ],
     }
 
