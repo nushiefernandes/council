@@ -21,12 +21,99 @@ Or activate the venv first:
 """
 import sys
 import os
+import json
+import requests
 from pathlib import Path
+from typing import Literal
+from pydantic import BaseModel
 from crewai import Agent, Task, Crew, Process, LLM
+from crewai.tools import tool
 
 # Workspace for generated files
 WORKSPACE_DIR = Path.home() / ".council" / "crewai-council" / "workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# PHASE 2: Structured Output Schemas
+# =============================================================================
+
+class Issue(BaseModel):
+    """A single issue found during code review."""
+    severity: Literal["critical", "major", "minor"]
+    file: str
+    description: str
+    suggestion: str
+
+
+class ReviewResult(BaseModel):
+    """Structured output from a code review."""
+    issues: list[Issue]
+    approved: bool
+    summary: str
+
+
+# =============================================================================
+# PHASE 2: File Writing Tool
+# =============================================================================
+
+@tool("write_file")
+def write_file(filename: str, content: str) -> str:
+    """
+    Write content to a file in the workspace directory.
+
+    Args:
+        filename: Name of the file to create (e.g., 'main.py', 'utils/helpers.py')
+        content: The content to write to the file
+
+    Returns:
+        Confirmation message with file path
+    """
+    file_path = WORKSPACE_DIR / filename
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content)
+    return f"✓ Wrote {len(content)} chars to {file_path}"
+
+
+# =============================================================================
+# PHASE 2: Provider Status Check
+# =============================================================================
+
+def check_providers() -> dict[str, bool]:
+    """Check which providers are available at startup."""
+    status = {}
+
+    # Check Anthropic
+    status["anthropic"] = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    # Check OpenAI
+    status["openai"] = bool(os.environ.get("OPENAI_API_KEY"))
+
+    # Check Ollama
+    try:
+        resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+        models = [m["name"] for m in resp.json().get("models", [])]
+        status["ollama"] = any("deepseek" in m for m in models)
+    except Exception:
+        status["ollama"] = False
+
+    return status
+
+
+def print_provider_status(status: dict[str, bool]) -> bool:
+    """Print provider status and return True if all available."""
+    print("\nProvider Status:")
+    all_ok = True
+    for provider, available in status.items():
+        icon = "✓" if available else "✗"
+        print(f"  {icon} {provider}")
+        if not available:
+            all_ok = False
+
+    if not all_ok:
+        print("\n⚠️  Some providers unavailable. Council may not function correctly.")
+
+    return all_ok
 
 
 def create_agents():
@@ -60,14 +147,16 @@ def create_agents():
 
     # === BUILDER ===
 
-    # GPT 5.2 as Builder
+    # GPT 5.2 as Builder (with file writing tool)
     builder = Agent(
         role="Backend Developer",
         goal="Implement features following the architecture with clean, tested code",
         backstory="""You are a pragmatic backend developer who writes clean, efficient code.
         You follow best practices, write comprehensive tests, and document your work.
-        You implement exactly what's specified, no more, no less.""",
+        You implement exactly what's specified, no more, no less.
+        IMPORTANT: Use the write_file tool to save your code to actual files.""",
         llm="openai/gpt-5.2",
+        tools=[write_file],
         verbose=True,
         allow_delegation=False
     )
@@ -170,13 +259,14 @@ Requirements:
 4. Include type hints (if Python)
 5. Apply the performance optimizations suggested
 
-Output your code in clearly labeled code blocks with the filename as a comment on the first line.""",
+IMPORTANT: Use the write_file tool to save each file. Do NOT just output code blocks.
+For each file, call write_file(filename="path/to/file.py", content="...code...")""",
         expected_output="""Working code implementation with:
-- All necessary files
+- All files written using the write_file tool
 - Proper error handling
 - Type hints
 - Performance optimizations applied
-- Clear documentation""",
+- Summary of files created""",
         agent=builder,
         context=[plan_task_claude, plan_task_deepseek]
     )
@@ -254,6 +344,17 @@ def main():
     print(f"\n{'='*60}")
     print("CREWAI COUNCIL (Dual-Perspective)")
     print(f"{'='*60}")
+
+    # Phase 2: Check provider status
+    status = check_providers()
+    print_provider_status(status)
+
+    if not all(status.values()):
+        response = input("\nContinue anyway? [y/N]: ")
+        if response.lower() != 'y':
+            print("Aborted.")
+            sys.exit(1)
+
     print(f"\nTask: {task_description}")
     print(f"Workspace: {WORKSPACE_DIR}")
     print(f"\nAgents (5 total, 3 models):")
