@@ -339,7 +339,12 @@ def main():
         print('Example: python crew.py "Build a REST API for user authentication"')
         sys.exit(1)
 
-    task_description = " ".join(sys.argv[1:])
+    task_description = " ".join(sys.argv[1:]).strip()
+
+    if not task_description:
+        print("Error: Task description cannot be empty")
+        print("Usage: python crew.py <task description>")
+        sys.exit(1)
 
     print(f"\n{'='*60}")
     print("CREWAI COUNCIL (Dual-Perspective)")
