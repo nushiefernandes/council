@@ -1,0 +1,27 @@
+# CrewAI Council Configuration
+# Future: Override default model selection and role configuration
+
+# Model defaults (not yet implemented - crew.py has hardcoded values)
+models:
+  architect_primary: "anthropic/claude-opus-4-5-20251101"
+  architect_secondary: "ollama/deepseek-coder-v2:16b"
+  builder: "openai/gpt-5.2"
+  reviewer_primary: "anthropic/claude-opus-4-5-20251101"
+  reviewer_secondary: "ollama/deepseek-coder-v2:16b"
+
+# Ollama settings
+ollama:
+  base_url: "http://localhost:11434"
+  model: "deepseek-coder-v2:16b"
+
+# Future features (not yet implemented)
+features:
+  checkpoints: false          # --checkpoint flag
+  structured_output: false    # --output json flag
+  session_history: false      # --resume flag
+  graceful_degradation: true  # already partially implemented
+
+# Workspace settings
+workspace:
+  path: "~/.council/crewai-council/workspace"
+  sessions_path: "~/.council/crewai-council/sessions"
