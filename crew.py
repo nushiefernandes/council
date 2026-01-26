@@ -22,6 +22,7 @@ Or activate the venv first:
 import sys
 import os
 import json
+import argparse
 import requests
 from pathlib import Path
 from typing import Literal
@@ -143,6 +144,38 @@ def print_provider_status(status: dict[str, bool]) -> bool:
         print("\n⚠️  Some providers unavailable. Council may not function correctly.")
 
     return all_ok
+
+
+# =============================================================================
+# PHASE 3: Checkpoint System
+# =============================================================================
+
+def checkpoint(stage: str, summary: str) -> bool:
+    """
+    Pause execution and ask user for approval.
+
+    Args:
+        stage: Name of the completed stage (e.g., "PLANNING", "BUILDING")
+        summary: Brief summary of what was accomplished
+
+    Returns:
+        True if user approves, False otherwise (exits on abort)
+    """
+    print(f"\n{'='*60}")
+    print(f"CHECKPOINT: {stage} COMPLETE")
+    print(f"{'='*60}")
+    print(f"\n{summary[:2000]}")  # Truncate very long summaries
+
+    while True:
+        response = input("\n[A]pprove and continue, [R]eject and abort? [A/r]: ").strip().lower()
+        if response in ('', 'a', 'approve', 'yes', 'y'):
+            print("✓ Approved. Continuing to next stage...")
+            return True
+        elif response in ('r', 'reject', 'no', 'n', 'abort'):
+            print("✗ Rejected. Aborting session.")
+            sys.exit(0)
+        else:
+            print("Please enter 'A' to approve or 'R' to reject.")
 
 
 def create_agents():
@@ -362,24 +395,232 @@ def create_crew(task_description: str):
     return crew
 
 
+def run_with_checkpoints(task_description: str):
+    """Run the council with checkpoints between stages."""
+    architect_claude, architect_deepseek, builder, reviewer_claude, reviewer_deepseek = create_agents()
+
+    # === STAGE 1: PLANNING ===
+    print(f"\n{'='*60}")
+    print("STAGE 1: PLANNING")
+    print(f"{'='*60}\n")
+
+    plan_task_claude = Task(
+        description=f"""Design the architecture for the following task:
+
+{task_description}
+
+Provide:
+1. Overview of the solution
+2. Key components and their responsibilities
+3. Data flow between components
+4. API contracts (if applicable)
+5. File structure recommendation
+
+Keep it simple and pragmatic. No over-engineering.""",
+        expected_output="""A clear architecture document with:
+- Solution overview
+- Component breakdown
+- Data flow
+- File structure
+- Key technical decisions and rationale""",
+        agent=architect_claude
+    )
+
+    plan_task_deepseek = Task(
+        description="""Review the architecture proposal from the previous task.
+
+Your focus areas:
+1. Performance implications of the design choices
+2. Scalability concerns
+3. Potential bottlenecks
+4. Memory and resource usage
+5. Suggestions for optimization
+
+Enhance the architecture with performance considerations.""",
+        expected_output="""Enhanced architecture review with:
+- Agreement/disagreement with key decisions
+- Performance analysis
+- Scalability notes
+- Specific optimization suggestions
+- Final recommended architecture""",
+        agent=architect_deepseek,
+        context=[plan_task_claude]
+    )
+
+    planning_crew = Crew(
+        agents=[architect_claude, architect_deepseek],
+        tasks=[plan_task_claude, plan_task_deepseek],
+        process=Process.sequential,
+        verbose=True
+    )
+
+    planning_result = planning_crew.kickoff()
+
+    # Checkpoint after planning
+    checkpoint(
+        "PLANNING",
+        f"Architecture designed by Claude and reviewed by DeepSeek.\n\nSummary:\n{str(planning_result)[:1500]}"
+    )
+
+    # === STAGE 2: BUILDING ===
+    print(f"\n{'='*60}")
+    print("STAGE 2: BUILDING")
+    print(f"{'='*60}\n")
+
+    build_task = Task(
+        description=f"""Implement the architecture that was designed.
+
+Original task: {task_description}
+
+Architecture context (from planning phase):
+{str(planning_result)[:3000]}
+
+Requirements:
+1. Write clean, well-documented code
+2. Include error handling
+3. Follow the agreed file structure
+4. Include type hints (if Python)
+5. Apply the performance optimizations suggested
+
+IMPORTANT: Use the write_file tool to save each file. Do NOT just output code blocks.
+For each file, call write_file(filename="path/to/file.py", content="...code...")""",
+        expected_output="""Working code implementation with:
+- All files written using the write_file tool
+- Proper error handling
+- Type hints
+- Performance optimizations applied
+- Summary of files created""",
+        agent=builder
+    )
+
+    building_crew = Crew(
+        agents=[builder],
+        tasks=[build_task],
+        process=Process.sequential,
+        verbose=True
+    )
+
+    building_result = building_crew.kickoff()
+
+    # List files created
+    files_created = list(WORKSPACE_DIR.rglob("*"))
+    files_list = "\n".join(f"  - {f.relative_to(WORKSPACE_DIR)}" for f in files_created if f.is_file())
+
+    checkpoint(
+        "BUILDING",
+        f"Code implemented by GPT-5.2.\n\nFiles created:\n{files_list}\n\nSummary:\n{str(building_result)[:1000]}"
+    )
+
+    # === STAGE 3: REVIEW ===
+    print(f"\n{'='*60}")
+    print("STAGE 3: REVIEW")
+    print(f"{'='*60}\n")
+
+    review_task_claude = Task(
+        description=f"""Review the implementation for SECURITY and CORRECTNESS.
+
+Implementation context:
+{str(building_result)[:2000]}
+
+Your focus areas:
+1. Security vulnerabilities (injection, auth issues, data exposure)
+2. Edge cases and error handling
+3. Input validation
+4. Race conditions or concurrency issues
+5. Maintainability concerns
+
+Provide specific, actionable feedback with code examples for fixes.""",
+        expected_output="""Security-focused code review with:
+- Security issues found (severity: critical/major/minor)
+- Edge cases identified
+- Specific fixes with code examples
+- Overall security assessment""",
+        agent=reviewer_claude
+    )
+
+    review_task_deepseek = Task(
+        description=f"""Review the implementation for PERFORMANCE and EFFICIENCY.
+
+Implementation context:
+{str(building_result)[:2000]}
+
+Your focus areas:
+1. Algorithm efficiency (time complexity)
+2. Memory usage and potential leaks
+3. Database query optimization (if applicable)
+4. Unnecessary computations or redundant operations
+5. Caching opportunities
+
+Provide specific, actionable feedback with benchmarks or complexity analysis where possible.""",
+        expected_output="""Performance-focused code review with:
+- Performance issues found (severity: critical/major/minor)
+- Complexity analysis
+- Optimization suggestions with code examples
+- Overall performance assessment""",
+        agent=reviewer_deepseek
+    )
+
+    review_crew = Crew(
+        agents=[reviewer_claude, reviewer_deepseek],
+        tasks=[review_task_claude, review_task_deepseek],
+        process=Process.sequential,
+        verbose=True
+    )
+
+    review_result = review_crew.kickoff()
+
+    checkpoint(
+        "REVIEW",
+        f"Code reviewed by Claude (security) and DeepSeek (performance).\n\nReview Summary:\n{str(review_result)[:1500]}"
+    )
+
+    return review_result
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python crew.py <task description>")
-        print('Example: python crew.py "Build a REST API for user authentication"')
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description="CrewAI Council - Multi-model AI deliberation system",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python crew.py "Build a REST API for user authentication"
+  python crew.py --checkpoint "Create a CLI tool"
+        """
+    )
+    parser.add_argument(
+        "task",
+        nargs="?",
+        help="Task description for the council"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help="Pause for approval between stages (planning, building, review)"
+    )
+
+    args = parser.parse_args()
+
+    # Handle missing task
+    if not args.task:
+        parser.print_help()
         sys.exit(1)
 
-    task_description = " ".join(sys.argv[1:]).strip()
-
+    task_description = args.task.strip()
     if not task_description:
         print("Error: Task description cannot be empty")
-        print("Usage: python crew.py <task description>")
         sys.exit(1)
 
     print(f"\n{'='*60}")
     print("CREWAI COUNCIL (Dual-Perspective)")
     print(f"{'='*60}")
 
-    # Phase 2: Check provider status
+    if args.checkpoint:
+        print("Mode: CHECKPOINT (will pause between stages)")
+    else:
+        print("Mode: CONTINUOUS (no pauses)")
+
+    # Check provider status
     status = check_providers()
     print_provider_status(status)
 
@@ -402,8 +643,12 @@ def main():
     print("    - Reviewer B (DeepSeek): Performance & efficiency")
     print(f"\n{'='*60}\n")
 
-    crew = create_crew(task_description)
-    result = crew.kickoff()
+    # Run with or without checkpoints
+    if args.checkpoint:
+        result = run_with_checkpoints(task_description)
+    else:
+        crew = create_crew(task_description)
+        result = crew.kickoff()
 
     print(f"\n{'='*60}")
     print("FINAL RESULT")
