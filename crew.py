@@ -69,8 +69,37 @@ def write_file(filename: str, content: str) -> str:
     Returns:
         Confirmation message with file path
     """
+    # Security: Reject absolute paths
+    if filename.startswith('/') or (len(filename) > 1 and filename[1] == ':'):
+        raise ValueError(f"Absolute paths not allowed: {filename}")
+
+    # Security: Reject path traversal attempts
+    if '..' in filename:
+        raise ValueError(f"Path traversal not allowed: {filename}")
+
+    # Construct the target path
     file_path = WORKSPACE_DIR / filename
+
+    # Security: Resolve the path and verify it's still within workspace
+    # This catches symlink attacks and any other path manipulation
+    try:
+        resolved_path = file_path.resolve()
+        workspace_resolved = WORKSPACE_DIR.resolve()
+
+        # Check that the resolved path is within the workspace
+        if not str(resolved_path).startswith(str(workspace_resolved)):
+            raise ValueError(f"Path escapes workspace: {filename}")
+    except (OSError, ValueError) as e:
+        raise ValueError(f"Invalid path: {filename} ({e})")
+
+    # Create parent directories (within workspace only)
     file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Final safety check after mkdir (in case of race conditions)
+    resolved_path = file_path.resolve()
+    if not str(resolved_path).startswith(str(workspace_resolved)):
+        raise ValueError(f"Path escapes workspace after resolution: {filename}")
+
     file_path.write_text(content)
     return f"✓ Wrote {len(content)} chars to {file_path}"
 
