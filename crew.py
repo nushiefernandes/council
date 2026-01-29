@@ -24,6 +24,12 @@ import os
 import json
 import argparse
 import requests
+import subprocess
+import time
+import shutil
+import fcntl
+import tempfile
+import atexit
 from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel
@@ -33,6 +39,129 @@ from crewai.tools import tool
 # Workspace for generated files
 WORKSPACE_DIR = Path.home() / ".council" / "crewai-council" / "workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# OLLAMA AUTO-START
+# =============================================================================
+
+# Global state for Ollama process management
+_OLLAMA_PID_FILE = Path(tempfile.gettempdir()) / "crewai_ollama.pid"
+_OLLAMA_LOCK_FILE = Path(tempfile.gettempdir()) / "crewai_ollama.lock"
+_started_ollama_pid: int | None = None
+
+def _check_ollama_quick(timeout: float = 5.0, verify_model: str | None = None) -> bool:
+    """Quick check if Ollama is responding, optionally verify model exists."""
+    try:
+        resp = requests.get("http://localhost:11434/api/tags", timeout=timeout)
+        if resp.status_code != 200:
+            return False
+        if verify_model:
+            models = [m["name"] for m in resp.json().get("models", [])]
+            return any(verify_model in m for m in models)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_ollama_running(max_wait: int = 30, verify_model: str = "deepseek") -> bool:
+    """
+    Start Ollama if not running, wait until ready.
+    Uses file locking to prevent race conditions across processes.
+
+    Args:
+        max_wait: Maximum seconds to wait for Ollama to start
+        verify_model: Model name substring to verify (default: "deepseek")
+
+    Returns:
+        True if Ollama is running with required model, False otherwise
+    """
+    global _started_ollama_pid
+
+    # Quick check if already running with correct model
+    if _check_ollama_quick(verify_model=verify_model):
+        return True
+
+    # Acquire lock to prevent race condition
+    lock_fd = None
+    try:
+        lock_fd = open(_OLLAMA_LOCK_FILE, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        # Another process is starting Ollama - wait for it
+        print("Another process is starting Ollama, waiting...")
+        if lock_fd:
+            lock_fd.close()
+        return _wait_for_ollama(max_wait, verify_model)
+
+    try:
+        # Double-check after acquiring lock
+        if _check_ollama_quick(verify_model=verify_model):
+            return True
+
+        print("Ollama not running. Attempting to start...")
+
+        # Find ollama binary securely
+        ollama_path = shutil.which("ollama")
+        if not ollama_path:
+            print("Error: 'ollama' command not found. Install from https://ollama.ai")
+            return False
+
+        # Start Ollama
+        try:
+            proc = subprocess.Popen(
+                [ollama_path, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            _started_ollama_pid = proc.pid
+            _OLLAMA_PID_FILE.write_text(str(proc.pid))
+        except Exception as e:
+            print(f"Error starting Ollama: {e}")
+            return False
+
+        # Wait for ready
+        return _wait_for_ollama(max_wait, verify_model)
+
+    finally:
+        if lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+
+
+def _wait_for_ollama(max_wait: int, verify_model: str | None) -> bool:
+    """Wait for Ollama to become ready."""
+    start = time.time()
+    while time.time() - start < max_wait:
+        if _check_ollama_quick(verify_model=verify_model):
+            print(f"✓ Ollama ready ({time.time() - start:.1f}s)")
+            return True
+        time.sleep(1)
+
+    print(f"Ollama failed to start within {max_wait}s")
+    _cleanup_ollama()
+    return False
+
+
+def _cleanup_ollama():
+    """Clean up Ollama process if we started it."""
+    global _started_ollama_pid
+    if _started_ollama_pid:
+        try:
+            import signal
+            os.kill(_started_ollama_pid, signal.SIGTERM)
+            print(f"Cleaned up Ollama process {_started_ollama_pid}")
+        except ProcessLookupError:
+            pass  # Already dead
+        except Exception as e:
+            print(f"Warning: Could not clean up Ollama: {e}")
+        _started_ollama_pid = None
+    _OLLAMA_PID_FILE.unlink(missing_ok=True)
+
+
+# Register cleanup handler
+atexit.register(_cleanup_ollama)
 
 
 # =============================================================================
@@ -702,6 +831,11 @@ Examples:
         action="store_true",
         help="Skip provider confirmation prompt (continue even if some providers unavailable)"
     )
+    parser.add_argument(
+        "--no-ollama",
+        action="store_true",
+        help="Skip Ollama auto-start (use if you don't have DeepSeek)"
+    )
 
     args = parser.parse_args()
 
@@ -723,6 +857,10 @@ Examples:
         print("Mode: CHECKPOINT (will pause between stages)")
     else:
         print("Mode: CONTINUOUS (no pauses)")
+
+    # Auto-start Ollama if needed (unless --no-ollama flag)
+    if not args.no_ollama:
+        ensure_ollama_running()
 
     # Check provider status
     status = check_providers()

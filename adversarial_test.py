@@ -1035,7 +1035,191 @@ def test_ollama_retry_behavior():
 
 
 # =============================================================================
-# TEST CATEGORY 9: CrewAI Integration
+# TEST CATEGORY 9: Ollama Auto-Start
+# =============================================================================
+
+def test_ensure_ollama_function_exists():
+    """Test ensure_ollama_running function exists."""
+    result = TestResult("Ollama Auto-Start Function")
+
+    try:
+        from crew import ensure_ollama_running
+        return result.pass_("ensure_ollama_running function exists")
+    except ImportError:
+        return result.fail("ensure_ollama_running function not found")
+
+
+def test_check_ollama_quick_function():
+    """Test _check_ollama_quick helper exists."""
+    result = TestResult("Ollama Quick Check Function")
+
+    try:
+        from crew import _check_ollama_quick
+        return result.pass_("_check_ollama_quick function exists")
+    except ImportError:
+        return result.fail("_check_ollama_quick function not found")
+
+
+def test_ollama_quick_check_returns_bool():
+    """Test _check_ollama_quick returns boolean."""
+    result = TestResult("Ollama Quick Check Type")
+
+    from crew import _check_ollama_quick
+
+    ret = _check_ollama_quick()
+    if isinstance(ret, bool):
+        return result.pass_(f"Returns bool: {ret}")
+
+    return result.fail(f"Expected bool, got {type(ret)}")
+
+
+def test_ollama_auto_start_handles_missing_binary():
+    """Test graceful handling when ollama binary not found."""
+    result = TestResult("Ollama Missing Binary")
+
+    from crew import ensure_ollama_running
+    from unittest.mock import patch
+
+    # Now uses shutil.which() which returns None when binary not found
+    with patch('crew.shutil.which', return_value=None):
+        with patch('crew._check_ollama_quick', return_value=False):
+            with patch('builtins.print'):
+                ret = ensure_ollama_running()
+                if ret == False:
+                    return result.pass_("Returns False when binary missing")
+
+    return result.fail("Should return False when ollama not found")
+
+
+def test_ollama_auto_start_returns_true_when_running():
+    """Test returns True immediately when Ollama already running."""
+    result = TestResult("Ollama Already Running")
+
+    from crew import ensure_ollama_running
+    from unittest.mock import patch
+
+    with patch('crew._check_ollama_quick', return_value=True):
+        ret = ensure_ollama_running()
+        if ret == True:
+            return result.pass_("Returns True when already running")
+
+    return result.fail("Should return True when already running")
+
+
+def test_no_ollama_flag_exists():
+    """Test --no-ollama flag is accepted."""
+    result = TestResult("No-Ollama Flag Exists")
+
+    proc = subprocess.run(
+        [sys.executable, "crew.py", "--help"],
+        capture_output=True,
+        text=True,
+        cwd=CREW_DIR,
+        timeout=10
+    )
+
+    if "--no-ollama" in proc.stdout or "--no-ollama" in proc.stderr:
+        return result.pass_("--no-ollama flag in help")
+
+    return result.fail("--no-ollama flag not found")
+
+
+def test_ollama_file_locking():
+    """Test that file locking is implemented for Ollama auto-start."""
+    result = TestResult("Ollama File Locking")
+
+    from crew import _OLLAMA_LOCK_FILE
+    import fcntl
+
+    # Verify lock file path is defined
+    if not _OLLAMA_LOCK_FILE:
+        return result.fail("Lock file path not defined")
+
+    # Verify fcntl is used in ensure_ollama_running
+    import inspect
+    from crew import ensure_ollama_running
+    source = inspect.getsource(ensure_ollama_running)
+
+    if 'fcntl.flock' in source and 'LOCK_EX' in source:
+        return result.pass_("File locking implemented with fcntl")
+
+    return result.fail("File locking not properly implemented")
+
+
+def test_ollama_pid_storage():
+    """Test that PID is stored when Ollama is started."""
+    result = TestResult("Ollama PID Storage")
+
+    from crew import _OLLAMA_PID_FILE, _started_ollama_pid
+    import inspect
+    from crew import ensure_ollama_running
+
+    # Verify PID file path is defined
+    if not _OLLAMA_PID_FILE:
+        return result.fail("PID file path not defined")
+
+    # Verify PID storage is implemented
+    source = inspect.getsource(ensure_ollama_running)
+
+    if '_started_ollama_pid' in source and 'proc.pid' in source:
+        return result.pass_("PID storage implemented")
+
+    return result.fail("PID storage not properly implemented")
+
+
+def test_ollama_cleanup_on_failure():
+    """Test that cleanup is called when Ollama fails to start."""
+    result = TestResult("Ollama Cleanup on Failure")
+
+    from crew import _cleanup_ollama
+    import inspect
+
+    # Verify cleanup function exists and handles PID
+    source = inspect.getsource(_cleanup_ollama)
+
+    if 'SIGTERM' in source and '_started_ollama_pid' in source:
+        return result.pass_("Cleanup function properly terminates process")
+
+    return result.fail("Cleanup not properly implemented")
+
+
+def test_ollama_binary_path_resolution():
+    """Test that shutil.which is used to find ollama binary."""
+    result = TestResult("Ollama Binary Path Resolution")
+
+    import inspect
+    from crew import ensure_ollama_running
+
+    source = inspect.getsource(ensure_ollama_running)
+
+    if 'shutil.which' in source and 'ollama_path' in source:
+        return result.pass_("shutil.which used for secure binary discovery")
+
+    return result.fail("shutil.which not used for binary discovery")
+
+
+def test_ollama_model_verification():
+    """Test that model verification is implemented."""
+    result = TestResult("Ollama Model Verification")
+
+    from crew import _check_ollama_quick
+    import inspect
+
+    # Check function signature includes verify_model parameter
+    sig = inspect.signature(_check_ollama_quick)
+    params = list(sig.parameters.keys())
+
+    if 'verify_model' in params:
+        # Also verify the implementation checks models
+        source = inspect.getsource(_check_ollama_quick)
+        if 'models' in source and 'verify_model' in source:
+            return result.pass_("Model verification implemented")
+
+    return result.fail("Model verification not implemented")
+
+
+# =============================================================================
+# TEST CATEGORY 10: CrewAI Integration
 # =============================================================================
 
 def test_create_crew_with_empty_task():
@@ -1183,7 +1367,20 @@ def main():
             test_workspace_permission_denied,
             test_ollama_retry_behavior,
         ],
-        "9. CrewAI Integration": [
+        "9. Ollama Auto-Start": [
+            test_ensure_ollama_function_exists,
+            test_check_ollama_quick_function,
+            test_ollama_quick_check_returns_bool,
+            test_ollama_auto_start_handles_missing_binary,
+            test_ollama_auto_start_returns_true_when_running,
+            test_no_ollama_flag_exists,
+            test_ollama_file_locking,
+            test_ollama_pid_storage,
+            test_ollama_cleanup_on_failure,
+            test_ollama_binary_path_resolution,
+            test_ollama_model_verification,
+        ],
+        "10. CrewAI Integration": [
             test_create_crew_with_empty_task,
             test_agent_llm_config,
             test_review_result_model,
