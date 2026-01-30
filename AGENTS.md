@@ -13,7 +13,6 @@
 | Flag | Purpose |
 |------|---------|
 | `--checkpoint` | Pause between stages (A=approve, R=reject) |
-| `--design` | Design mode - UI mockups instead of code |
 | `-y` / `--yes` | Skip provider confirmation |
 | `--no-ollama` | Skip Ollama auto-start |
 
@@ -46,7 +45,7 @@ Watch deliberation in real-time:
 tail -f ~/.council/crewai-council/workspace/deliberation.jsonl | jq -c
 ```
 
-## Pipeline (Code Mode - Default)
+## Pipeline
 
 | Stage | Agent | Model | Focus |
 |-------|-------|-------|-------|
@@ -56,46 +55,15 @@ tail -f ~/.council/crewai-council/workspace/deliberation.jsonl | jq -c
 | Review | Reviewer A | Claude Opus 4.5 | Security & edge cases |
 | Review | Reviewer B | DeepSeek | Performance & efficiency |
 
-## Design Mode (`--design`)
-
-Use for UI/UX work instead of code generation:
-
-```bash
-~/.council/crewai-council/venv/bin/python ~/.council/crewai-council/crew.py --design "<design task>"
-```
-
-| Stage | Agent | Model | Focus |
-|-------|-------|-------|-------|
-| 1 | UX Designer | Claude Opus 4.5 | User flows, interaction patterns |
-| 2 | Visual Designer | GPT-5.2 | 2-3 aesthetic directions as HTML |
-| 3 | Technical Designer | DeepSeek | Feasibility review |
-| 4 | Synthesizer | Claude Opus 4.5 | DESIGN-BRIEF.md with tradeoffs |
-
-**Output**: `~/.council/crewai-council/workspace/design/`
-- `option-a.html`, `option-b.html` (viewable mockups)
-- `DESIGN-BRIEF.md` (comparison + recommendation)
-
 ## Agent Capabilities
 
 | Agent | Tools Available |
 |-------|-----------------|
 | Architects | `discover_skill` (GitHub search), `spawn_research`/`collect_research` (web research) |
 | Builder | `write_file` (saves directly to workspace) |
-| Reviewers | `list_skills`, `query_skill`, `discover_skill`, `spawn_research`/`collect_research` |
+| Reviewers | `query_skill` (postgres/react/web-design), `discover_skill`, `spawn_research`/`collect_research` |
 
 **Note**: Builder writes files directly - no manual copy needed after completion.
-
-## Skill Tools
-
-Agents can access Claude Code skills for domain expertise:
-
-| Tool | Purpose |
-|------|---------|
-| `list_skills` | See all available skills (run first) |
-| `query_skill(name, query)` | Search a skill for guidance |
-| `discover_skill(query)` | Search GitHub for new skills |
-
-Skills are auto-discovered from `~/.claude/skills/` and installed plugins. No hardcoded list - agents can query any installed skill.
 
 ## Output Locations
 

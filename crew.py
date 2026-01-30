@@ -320,141 +320,58 @@ def write_file(filename: str, content: str) -> str:
 # SKILL INTEGRATION: Allow agents to query Claude Code skills
 # =============================================================================
 
-def find_skill(skill_name: str) -> Path | None:
-    """
-    Find a skill by name across all skill locations.
-    Returns path to SKILL.md or AGENTS.md, or None if not found.
-
-    Priority: ~/.claude/skills/ > claude-code-plugins > claude-plugins-official
-    """
-    SKILLS_LOCATIONS = [
-        (Path.home() / ".claude" / "skills", "direct"),
-        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-code-plugins" / "plugins", "nested"),
-        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-plugins-official" / "plugins", "nested"),
-    ]
-
-    for base_path, structure in SKILLS_LOCATIONS:
-        if not base_path.exists():
-            continue
-
-        if structure == "direct":
-            skill_dir = base_path / skill_name
-        else:
-            skill_dir = base_path / skill_name / "skills" / skill_name
-
-        for filename in ["AGENTS.md", "SKILL.md"]:
-            skill_file = skill_dir / filename
-            if skill_file.exists():
-                return skill_file
-
-    return None
-
-
-def extract_description(skill_file: Path, max_length: int = 100) -> str:
-    """Extract description from skill file frontmatter or first paragraph."""
-    try:
-        content = skill_file.read_text()
-
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            if len(parts) >= 3:
-                for line in parts[1].split("\n"):
-                    if line.startswith("description:"):
-                        desc = line.replace("description:", "").strip().strip('"\'')
-                        return desc[:max_length] + ("..." if len(desc) > max_length else "")
-
-        for line in content.split("\n"):
-            line = line.strip()
-            if line and not line.startswith("#") and not line.startswith("---"):
-                return line[:max_length] + ("..." if len(line) > max_length else "")
-
-        return "No description available"
-    except Exception:
-        return "No description available"
-
-
-@tool("list_skills")
-def list_skills_tool() -> str:
-    """
-    List all available skills that can be queried.
-
-    Returns skill names with brief descriptions. Use this before
-    query_skill to discover what expertise is available for your task.
-    """
-    SKILLS_LOCATIONS = [
-        (Path.home() / ".claude" / "skills", "direct"),
-        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-code-plugins" / "plugins", "nested"),
-        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-plugins-official" / "plugins", "nested"),
-    ]
-
-    skills = []
-    seen_names = set()
-
-    for base_path, structure in SKILLS_LOCATIONS:
-        if not base_path.exists():
-            continue
-
-        try:
-            for item in sorted(base_path.iterdir()):
-                if not item.is_dir() or item.name.startswith("."):
-                    continue
-
-                skill_name = item.name
-                if skill_name in seen_names:
-                    continue
-
-                skill_file = find_skill(skill_name)
-                if not skill_file:
-                    continue
-
-                description = extract_description(skill_file)
-                skills.append(f"  - {skill_name}: {description}")
-                seen_names.add(skill_name)
-
-        except PermissionError:
-            continue
-
-    if not skills:
-        return "No skills found. Check ~/.claude/skills/ directory."
-
-    header = f"Available skills ({len(skills)}):\n"
-
-    if len(skills) > 25:
-        return header + "\n".join(skills[:25]) + f"\n  ... and {len(skills) - 25} more"
-
-    return header + "\n".join(skills)
+SKILLS_DIR = Path.home() / ".claude" / "skills"
+ALLOWED_SKILLS = {
+    "postgres-best-practices",
+    "react-best-practices",
+    "web-design-guidelines",
+}
 
 
 @tool("query_skill")
 def query_skill(skill_name: str, query: str) -> str:
     """
-    Query a skill for relevant guidance.
+    Query a Claude Code skill for best practices and guidelines.
 
-    Use list_skills first to see available skills, then query specific ones.
+    Use this to get expert guidance on specific topics. Available skills:
+    - postgres-best-practices: Database optimization, indexes, queries
+    - react-best-practices: React/Next.js patterns, performance, hooks
+    - web-design-guidelines: UI/UX, accessibility, design systems
 
     Args:
-        skill_name: Name of the skill (from list_skills output)
-        query: What you want to look up (e.g., "typography", "accessibility")
+        skill_name: One of the available skill names listed above
+        query: What you want to look up (e.g., "index optimization", "React hooks")
 
     Returns:
         Relevant guidance from the skill documentation
     """
-    skill_file = find_skill(skill_name)
+    if skill_name not in ALLOWED_SKILLS:
+        return f"Error: Unknown skill '{skill_name}'. Available: {', '.join(ALLOWED_SKILLS)}"
 
-    if not skill_file:
-        return f"Error: Skill '{skill_name}' not found. Run list_skills to see available skills."
+    skill_path = SKILLS_DIR / skill_name
 
-    try:
+    if not skill_path.exists():
+        return f"Error: Skill '{skill_name}' not found at {skill_path}"
+
+    # Try to read AGENTS.md first (compiled for agents), then SKILL.md
+    agents_file = skill_path / "AGENTS.md"
+    skill_file = skill_path / "SKILL.md"
+
+    if agents_file.exists():
+        content = agents_file.read_text()
+    elif skill_file.exists():
         content = skill_file.read_text()
-    except Exception as e:
-        return f"Error reading skill '{skill_name}': {e}"
+    else:
+        return f"Error: No readable content in skill '{skill_name}'"
 
+    # Simple keyword search - return matching lines
     query_lower = query.lower()
     lines = content.split('\n')
     relevant = []
 
     for i, line in enumerate(lines):
         if query_lower in line.lower():
+            # Include surrounding context (2 lines before/after)
             start = max(0, i - 2)
             end = min(len(lines), i + 3)
             context = '\n'.join(lines[start:end])
@@ -463,160 +380,11 @@ def query_skill(skill_name: str, query: str) -> str:
 
     if relevant:
         result = f"From {skill_name} (query: '{query}'):\n\n"
-        result += "\n---\n".join(relevant[:5])
-        if len(result) > 4000:
-            result = result[:4000] + "\n... (truncated)"
+        result += "\n---\n".join(relevant[:5])  # Limit to 5 matches
         return result
     else:
-        return f"No matches for '{query}' in {skill_name}. Try a different query or run list_skills to find other skills."
-
-
-# =============================================================================
-# SUBAGENT SPAWNING: Parallel research for architects and reviewers
-# =============================================================================
-
-# Global coordinator instance (lazy-initialized)
-_subagent_coordinator = None
-
-
-def _get_coordinator():
-    """Get or create the global subagent coordinator."""
-    global _subagent_coordinator
-    if _subagent_coordinator is None:
-        # Import subagent module from workspace
-        subagent_path = WORKSPACE_DIR / "workspace" / "core" / "subagent"
-        if subagent_path.exists():
-            # Add the core directory to path so 'subagent' package can be imported
-            core_path = subagent_path.parent
-            if str(core_path) not in sys.path:
-                sys.path.insert(0, str(core_path))
-            from subagent import SubagentCoordinator, ResourceManager, TaskGraph, Memory
-
-            _subagent_coordinator = SubagentCoordinator(
-                task_graph=TaskGraph(max_workers=3),
-                resource_manager=ResourceManager(),
-                memory=Memory(),
-                research_executor=_web_research_executor,
-            )
-        else:
-            raise ImportError(f"Subagent module not found at {subagent_path}")
-    return _subagent_coordinator
-
-
-def _web_research_executor(query: str) -> tuple[str, list[str]]:
-    """Execute a web search and return (content, sources).
-
-    Uses DuckDuckGo search via subprocess for simplicity and no API key requirement.
-    """
-    import warnings
-
-    try:
-        # Try using ddgs (new package name) or duckduckgo-search (old name)
-        DDGS = None
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                try:
-                    from ddgs import DDGS
-                except ImportError:
-                    from duckduckgo_search import DDGS
-        except ImportError:
-            pass
-
-        if DDGS is not None:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=5))
-                if results:
-                    content_parts = []
-                    sources = []
-                    for r in results:
-                        content_parts.append(f"**{r.get('title', 'Untitled')}**\n{r.get('body', '')}")
-                        if r.get('href'):
-                            sources.append(r['href'])
-                    return "\n\n".join(content_parts), sources
-
-        # Fallback: simple message indicating no search available
-        return f"[Research query: {query}] - No search backend available. Install ddgs package for web research.", []
-
-    except Exception as e:
-        return f"Research failed for query '{query}': {str(e)}", []
-
-
-@tool("spawn_research")
-def spawn_research_tool(queries: str) -> str:
-    """
-    Spawn parallel research agents for multiple queries.
-
-    Use this to research multiple topics simultaneously. The research runs
-    in parallel (up to 3 concurrent queries) and results can be collected later.
-
-    Args:
-        queries: Comma-separated list of research queries
-                 Example: "python async patterns, rust error handling, go channels"
-
-    Returns:
-        Comma-separated task IDs for collecting results later with collect_research
-    """
-    try:
-        coordinator = _get_coordinator()
-        query_list = [q.strip() for q in queries.split(",") if q.strip()]
-
-        if not query_list:
-            return "Error: No valid queries provided. Pass comma-separated queries."
-
-        if len(query_list) > 5:
-            return f"Error: Maximum 5 queries at once. You provided {len(query_list)}."
-
-        task_ids = coordinator.spawn_research(query_list, timeout=120)
-        return ",".join(task_ids)
-
-    except ImportError as e:
-        return f"Error: Subagent module not available - {e}"
-    except Exception as e:
-        return f"Error spawning research: {e}"
-
-
-@tool("collect_research")
-def collect_research_tool(task_ids: str) -> str:
-    """
-    Collect results from spawned research agents.
-
-    Use this after spawn_research to retrieve the research findings.
-    Will wait for all queries to complete (up to 120s timeout each).
-
-    Args:
-        task_ids: Comma-separated task IDs from spawn_research
-
-    Returns:
-        Aggregated research findings with sources
-    """
-    try:
-        coordinator = _get_coordinator()
-        id_list = [tid.strip() for tid in task_ids.split(",") if tid.strip()]
-
-        if not id_list:
-            return "Error: No valid task IDs provided."
-
-        results = coordinator.collect_results(id_list, timeout=120)
-
-        # Format results for agent consumption
-        output_parts = []
-        for task_id, result in results.items():
-            if isinstance(result, dict) and "error" in result:
-                output_parts.append(f"[{task_id}] Error: {result['error']}")
-            elif hasattr(result, 'content'):
-                # ResearchResult object
-                sources_str = ", ".join(result.sources[:3]) if result.sources else "no sources"
-                output_parts.append(f"[{task_id}] Query: {result.query}\n{result.content}\nSources: {sources_str}")
-            else:
-                output_parts.append(f"[{task_id}] {str(result)}")
-
-        return "\n\n---\n\n".join(output_parts) if output_parts else "No results collected."
-
-    except ImportError as e:
-        return f"Error: Subagent module not available - {e}"
-    except Exception as e:
-        return f"Error collecting research: {e}"
+        # Return a summary of the skill if no matches
+        return f"No matches for '{query}' in {skill_name}. Skill contains {len(lines)} lines of guidance on {skill_name.replace('-', ' ')}."
 
 
 # =============================================================================
@@ -856,10 +624,9 @@ def create_agents():
         backstory="""You are a senior software architect with 15+ years of experience.
         You focus on clean architecture, separation of concerns, and pragmatic design decisions.
         You prefer simple solutions that are easy to understand and maintain.
-        Use discover_skill to find relevant skills/best practices for the task domain.
-        Use spawn_research to research multiple topics in parallel, then collect_research to get results.""",
+        Use discover_skill to find relevant skills/best practices for the task domain.""",
         llm="anthropic/claude-opus-4-5-20251101",
-        tools=[discover_skill_tool, spawn_research_tool, collect_research_tool],
+        tools=[discover_skill_tool],
         verbose=True,
         allow_delegation=False,
         step_callback=agent_step_callback
@@ -871,10 +638,8 @@ def create_agents():
         goal="Review architecture for performance, scalability, and practical implementation concerns",
         backstory="""You are an architect focused on performance and scalability.
         You review designs for efficiency, identify potential bottlenecks, and suggest optimizations.
-        You ensure the architecture will perform well under load.
-        Use spawn_research to research performance patterns in parallel, then collect_research to get results.""",
+        You ensure the architecture will perform well under load.""",
         llm=LLM(model="ollama/deepseek-coder-v2:16b", base_url="http://localhost:11434"),
-        tools=[spawn_research_tool, collect_research_tool],
         verbose=True,
         allow_delegation=False,
         step_callback=agent_step_callback
@@ -906,10 +671,9 @@ def create_agents():
         backstory="""You are a security-focused code reviewer who catches subtle bugs.
         You focus on security vulnerabilities, error handling, and edge cases.
         You provide specific, actionable feedback with code examples.
-        Use list_skills to see available expertise, then query_skill to get guidance.
-        Use discover_skill to find new skills and spawn_research for parallel research.""",
+        Use query_skill to check best practices and discover_skill to find relevant skills.""",
         llm="anthropic/claude-opus-4-5-20251101",
-        tools=[list_skills_tool, query_skill, discover_skill_tool, spawn_research_tool, collect_research_tool],
+        tools=[query_skill, discover_skill_tool],
         verbose=True,
         allow_delegation=False,
         step_callback=agent_step_callback
@@ -922,188 +686,15 @@ def create_agents():
         backstory="""You are a performance-focused code reviewer.
         You identify slow algorithms, memory issues, and optimization opportunities.
         You suggest concrete performance improvements with benchmarks when possible.
-        Use list_skills to see available expertise, then query_skill to get guidance.
-        Use discover_skill to find new skills and spawn_research for parallel research.""",
+        Use query_skill for best practices and discover_skill to find relevant skills.""",
         llm=LLM(model="ollama/deepseek-coder-v2:16b", base_url="http://localhost:11434"),
-        tools=[list_skills_tool, query_skill, discover_skill_tool, spawn_research_tool, collect_research_tool],
+        tools=[query_skill, discover_skill_tool],
         verbose=True,
         allow_delegation=False,
         step_callback=agent_step_callback
     )
 
     return architect_claude, architect_deepseek, builder, reviewer_claude, reviewer_deepseek
-
-
-# =============================================================================
-# DESIGN MODE: UI/UX focused agents for mockup generation
-# =============================================================================
-
-def create_design_agents():
-    """Create agents specialized for design exploration."""
-
-    ux_designer = Agent(
-        role="UX Designer (Claude)",
-        goal="Design intuitive user flows, information architecture, and interaction patterns",
-        backstory="""You are a senior UX designer focused on how interfaces FEEL to use.
-        You think about user journeys, cognitive load, thumb reachability on mobile,
-        and emotional resonance. You avoid complexity unless it serves the user.
-
-        Start by running list_skills to see available expertise, then query relevant
-        skills like web-design-guidelines for accessibility guidance.""",
-        llm="anthropic/claude-opus-4-5-20251101",
-        tools=[list_skills_tool, query_skill, discover_skill_tool, spawn_research_tool, collect_research_tool],
-        verbose=True,
-        allow_delegation=False,
-        step_callback=agent_step_callback
-    )
-
-    visual_designer = Agent(
-        role="Visual Designer (GPT)",
-        goal="Create distinctive, memorable visual designs that avoid generic AI aesthetics",
-        backstory="""You are a bold visual designer who hates cookie-cutter interfaces.
-        You think about typography (never use Inter/Arial), color palettes with personality,
-        spatial composition, and motion/micro-interactions.
-
-        Run list_skills first, then query_skill("frontend-design", "aesthetics") for guidance.
-        Use write_file to save mockups as viewable HTML files.""",
-        llm="openai/gpt-5.2",
-        tools=[write_file, list_skills_tool, query_skill],
-        verbose=True,
-        allow_delegation=False,
-        step_callback=agent_step_callback
-    )
-
-    tech_designer = Agent(
-        role="Technical Designer (DeepSeek)",
-        goal="Review designs for technical feasibility, mobile performance, and implementation complexity",
-        backstory="""You review design proposals with an engineer's eye.
-        You flag animations that cause jank, layouts that break on small screens,
-        and complexity that slows development. Suggest simpler alternatives when needed.
-
-        Use list_skills and query_skill for react-best-practices guidance.""",
-        llm=LLM(model="ollama/deepseek-coder-v2:16b", base_url="http://localhost:11434"),
-        tools=[list_skills_tool, query_skill],
-        verbose=True,
-        allow_delegation=False,
-        step_callback=agent_step_callback
-    )
-
-    synthesizer = Agent(
-        role="Design Synthesizer (Claude)",
-        goal="Combine design perspectives into clear options for human decision-making",
-        backstory="""You synthesize input from UX, visual, and technical designers
-        into 2-3 distinct design directions. Present tradeoffs clearly without
-        making the decision for the human. Save output as DESIGN-BRIEF.md.""",
-        llm="anthropic/claude-opus-4-5-20251101",
-        tools=[write_file],
-        verbose=True,
-        allow_delegation=False,
-        step_callback=agent_step_callback
-    )
-
-    return ux_designer, visual_designer, tech_designer, synthesizer
-
-
-def create_design_tasks(ux_designer, visual_designer, tech_designer, synthesizer, task_description: str):
-    """Create the 4-stage design pipeline tasks."""
-
-    ux_task = Task(
-        description=f"""Analyze the design requirements and create UX specifications:
-
-{task_description}
-
-First, run list_skills to see available expertise. Query relevant skills for guidance.
-
-Provide:
-1. User goals for this screen/flow
-2. Information hierarchy (what's most important?)
-3. Interaction patterns (tap, swipe, scroll behaviors)
-4. Mobile-first layout recommendations (thumb zones, reachability)
-5. Accessibility considerations
-
-Focus on HOW IT FEELS TO USE, not how it looks.""",
-        expected_output="""UX specification with:
-- User goals and success metrics
-- Information architecture
-- Interaction flow description
-- Mobile layout guidance
-- Accessibility notes""",
-        agent=ux_designer
-    )
-
-    visual_task = Task(
-        description="""Based on the UX specification, create 2-3 DISTINCT visual design directions.
-
-First, run list_skills and query_skill("frontend-design", "aesthetics") for guidelines.
-
-For EACH direction:
-1. Choose a unique aesthetic (e.g., warm minimalism, bold typography, soft organic)
-2. Define typography (distinctive fonts, not Inter/Arial/system fonts)
-3. Define color palette (with CSS variables)
-4. Create a viewable HTML mockup with embedded CSS
-
-REQUIREMENTS:
-- Each direction must be visually DIFFERENT (not variations of same theme)
-- Use write_file to save: design/option-a.html, design/option-b.html, etc.
-- Mobile-first (375px width, use max-width for desktop)
-- Include hover states and any micro-interactions
-
-If you discover a useful skill via discover_skill, note it for installation at checkpoint.""",
-        expected_output="""2-3 HTML mockup files saved to workspace/design/:
-- design/option-a.html
-- design/option-b.html
-- design/option-c.html (optional)
-
-Each viewable in browser with complete styling.""",
-        agent=visual_designer,
-        context=[ux_task]
-    )
-
-    tech_task = Task(
-        description="""Review the visual designs for technical feasibility.
-
-Run list_skills and query react-best-practices for guidance.
-
-For each design direction, assess:
-1. Implementation complexity (1-10 scale)
-2. Mobile performance concerns (animations, repaints, large images)
-3. Accessibility issues (contrast, focus states, screen reader)
-4. React component structure recommendations
-5. CSS concerns (browser support, layout stability)
-
-Flag issues but don't kill creativity - suggest alternatives that preserve the design intent.""",
-        expected_output="""Technical assessment for each design:
-- Complexity rating with justification
-- Performance flags and fixes
-- Accessibility audit results
-- Recommended component breakdown
-- CSS/implementation notes""",
-        agent=tech_designer,
-        context=[visual_task]
-    )
-
-    synthesis_task = Task(
-        description="""Synthesize all input into a design brief for human decision-making.
-
-Create a summary document that:
-1. Names each direction clearly (e.g., "Warm Minimalism", "Bold Editorial")
-2. Shows a side-by-side comparison table
-3. Lists pros/cons from UX, visual, and technical perspectives
-4. Notes which direction best fits the stated product vision
-5. Does NOT make the decision - presents options for human choice
-
-Use write_file to save as design/DESIGN-BRIEF.md""",
-        expected_output="""design/DESIGN-BRIEF.md containing:
-- Direction summaries with names
-- Comparison matrix
-- Tradeoffs from each perspective
-- Recommendation (without deciding)
-- Links to mockup files""",
-        agent=synthesizer,
-        context=[ux_task, visual_task, tech_task]
-    )
-
-    return [ux_task, visual_task, tech_task, synthesis_task]
 
 
 def create_tasks(architect_claude, architect_deepseek, builder, reviewer_claude, reviewer_deepseek, task_description: str):
@@ -1453,189 +1044,6 @@ Provide specific, actionable feedback with benchmarks or complexity analysis whe
     return review_result
 
 
-# =============================================================================
-# DESIGN MODE: Run the design pipeline
-# =============================================================================
-
-def run_design_mode(task_description: str, use_checkpoints: bool = False):
-    """Run the council in design mode."""
-
-    design_dir = WORKSPACE_DIR / "design"
-    design_dir.mkdir(parents=True, exist_ok=True)
-
-    log_deliberation(
-        agent_role="system",
-        event="design_mode_start",
-        content=f"Starting design mode: {task_description[:200]}"
-    )
-
-    print(f"\n{'='*60}")
-    print("DESIGN MODE")
-    print(f"{'='*60}")
-    print(f"\nAgents (4 total, 3 models):")
-    print("  UX ANALYSIS:")
-    print("    - UX Designer (Claude Opus 4.5): User flows, interaction patterns")
-    print("  VISUAL DESIGN:")
-    print("    - Visual Designer (GPT-5.2): Aesthetics, mockup generation")
-    print("  TECHNICAL REVIEW:")
-    print("    - Technical Designer (DeepSeek): Feasibility, performance")
-    print("  SYNTHESIS:")
-    print("    - Synthesizer (Claude Opus 4.5): Combine into options")
-    print(f"\nOutput: {design_dir}")
-    print(f"{'='*60}\n")
-
-    ux_designer, visual_designer, tech_designer, synthesizer = create_design_agents()
-    tasks = create_design_tasks(ux_designer, visual_designer, tech_designer, synthesizer, task_description)
-
-    if use_checkpoints:
-        # Stage 1: UX
-        log_deliberation(agent_role="system", event="stage_start", content="UX Analysis", stage="UX")
-        print(f"\n{'='*60}")
-        print("STAGE 1: UX ANALYSIS")
-        print(f"{'='*60}\n")
-
-        ux_crew = Crew(agents=[ux_designer], tasks=[tasks[0]], process=Process.sequential, verbose=True)
-        ux_result = ux_crew.kickoff()
-        checkpoint("UX ANALYSIS", f"UX specification complete.\n\n{str(ux_result)[:1500]}")
-
-        # Stage 2: Visual (inject UX context)
-        log_deliberation(agent_role="system", event="stage_start", content="Visual Design", stage="VISUAL")
-        print(f"\n{'='*60}")
-        print("STAGE 2: VISUAL DESIGN")
-        print(f"{'='*60}\n")
-
-        # Re-create visual task with context from UX result
-        visual_task_with_context = Task(
-            description=f"""Based on the UX specification below, create 2-3 DISTINCT visual design directions.
-
-UX SPECIFICATION:
-{str(ux_result)[:2500]}
-
-First, run list_skills and query_skill("frontend-design", "aesthetics") for guidelines.
-
-For EACH direction:
-1. Choose a unique aesthetic (e.g., warm minimalism, bold typography, soft organic)
-2. Define typography (distinctive fonts, not Inter/Arial/system fonts)
-3. Define color palette (with CSS variables)
-4. Create a viewable HTML mockup with embedded CSS
-
-REQUIREMENTS:
-- Each direction must be visually DIFFERENT (not variations of same theme)
-- Use write_file to save: design/option-a.html, design/option-b.html, etc.
-- Mobile-first (375px width, use max-width for desktop)
-- Include hover states and any micro-interactions""",
-            expected_output="""2-3 HTML mockup files saved to workspace/design/:
-- design/option-a.html
-- design/option-b.html
-- design/option-c.html (optional)
-
-Each viewable in browser with complete styling.""",
-            agent=visual_designer
-        )
-
-        visual_crew = Crew(agents=[visual_designer], tasks=[visual_task_with_context], process=Process.sequential, verbose=True)
-        visual_result = visual_crew.kickoff()
-
-        design_files = list(design_dir.glob("*.html"))
-        files_list = "\n".join(f"  - {f.name}" for f in design_files)
-        checkpoint("VISUAL DESIGN", f"Mockups created:\n{files_list}\n\n{str(visual_result)[:1000]}")
-
-        # Stage 3: Technical
-        log_deliberation(agent_role="system", event="stage_start", content="Technical Review", stage="TECHNICAL")
-        print(f"\n{'='*60}")
-        print("STAGE 3: TECHNICAL REVIEW")
-        print(f"{'='*60}\n")
-
-        tech_task_with_context = Task(
-            description=f"""Review the visual designs for technical feasibility.
-
-VISUAL DESIGN OUTPUT:
-{str(visual_result)[:2000]}
-
-Run list_skills and query react-best-practices for guidance.
-
-For each design direction, assess:
-1. Implementation complexity (1-10 scale)
-2. Mobile performance concerns (animations, repaints, large images)
-3. Accessibility issues (contrast, focus states, screen reader)
-4. React component structure recommendations
-5. CSS concerns (browser support, layout stability)
-
-Flag issues but don't kill creativity - suggest alternatives that preserve the design intent.""",
-            expected_output="""Technical assessment for each design:
-- Complexity rating with justification
-- Performance flags and fixes
-- Accessibility audit results
-- Recommended component breakdown
-- CSS/implementation notes""",
-            agent=tech_designer
-        )
-
-        tech_crew = Crew(agents=[tech_designer], tasks=[tech_task_with_context], process=Process.sequential, verbose=True)
-        tech_result = tech_crew.kickoff()
-        checkpoint("TECHNICAL REVIEW", f"Technical assessment complete.\n\n{str(tech_result)[:1500]}")
-
-        # Stage 4: Synthesis
-        log_deliberation(agent_role="system", event="stage_start", content="Synthesis", stage="SYNTHESIS")
-        print(f"\n{'='*60}")
-        print("STAGE 4: SYNTHESIS")
-        print(f"{'='*60}\n")
-
-        synth_task_with_context = Task(
-            description=f"""Synthesize all input into a design brief for human decision-making.
-
-UX SPECIFICATION:
-{str(ux_result)[:1500]}
-
-VISUAL DESIGNS:
-{str(visual_result)[:1500]}
-
-TECHNICAL ASSESSMENT:
-{str(tech_result)[:1500]}
-
-Create a summary document that:
-1. Names each direction clearly (e.g., "Warm Minimalism", "Bold Editorial")
-2. Shows a side-by-side comparison table
-3. Lists pros/cons from UX, visual, and technical perspectives
-4. Notes which direction best fits the stated product vision
-5. Does NOT make the decision - presents options for human choice
-
-Use write_file to save as design/DESIGN-BRIEF.md""",
-            expected_output="""design/DESIGN-BRIEF.md containing:
-- Direction summaries with names
-- Comparison matrix
-- Tradeoffs from each perspective
-- Recommendation (without deciding)
-- Links to mockup files""",
-            agent=synthesizer
-        )
-
-        synth_crew = Crew(agents=[synthesizer], tasks=[synth_task_with_context], process=Process.sequential, verbose=True)
-        result = synth_crew.kickoff()
-    else:
-        crew = Crew(
-            agents=[ux_designer, visual_designer, tech_designer, synthesizer],
-            tasks=tasks,
-            process=Process.sequential,
-            verbose=True
-        )
-        result = crew.kickoff()
-
-    # Summary
-    design_files = list(design_dir.glob("*"))
-    print(f"\n{'='*60}")
-    print("DESIGN OUTPUT")
-    print(f"{'='*60}")
-    for f in sorted(design_files):
-        print(f"  - {f.name}")
-    print(f"\nOpen HTML files in browser to view mockups.")
-    print(f"Read DESIGN-BRIEF.md for synthesis and recommendations.")
-
-    log_deliberation(agent_role="system", event="design_mode_complete", content=str(result)[:500])
-
-    return result
-
-
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(
@@ -1645,8 +1053,6 @@ def main():
 Examples:
   python crew.py "Build a REST API for user authentication"
   python crew.py --checkpoint "Create a CLI tool"
-  python crew.py --design "Design the home screen for a food diary app"
-  python crew.py --design --checkpoint "Design a mobile-first checkout flow"
         """
     )
     parser.add_argument(
@@ -1669,11 +1075,6 @@ Examples:
         action="store_true",
         help="Skip Ollama auto-start (use if you don't have DeepSeek)"
     )
-    parser.add_argument(
-        "--design",
-        action="store_true",
-        help="Run in design mode - generates UI mockups and design options instead of code"
-    )
 
     args = parser.parse_args()
 
@@ -1689,20 +1090,21 @@ Examples:
 
     # Initialize deliberation log for this session
     clear_deliberation_log()
-    # Determine mode
-    if args.design:
-        mode = "design_checkpoint" if args.checkpoint else "design"
-    elif args.checkpoint:
-        mode = "checkpoint"
-    else:
-        mode = "continuous"
-
     log_deliberation(
         agent_role="system",
         event="task_received",
         content=task_description,
-        mode=mode
+        mode="checkpoint" if args.checkpoint else "continuous"
     )
+
+    print(f"\n{'='*60}")
+    print("CREWAI COUNCIL (Dual-Perspective)")
+    print(f"{'='*60}")
+
+    if args.checkpoint:
+        print("Mode: CHECKPOINT (will pause between stages)")
+    else:
+        print("Mode: CONTINUOUS (no pauses)")
 
     # Auto-start Ollama if needed (unless --no-ollama flag)
     if not args.no_ollama:
@@ -1710,59 +1112,33 @@ Examples:
 
     # Check provider status
     status = check_providers()
+    print_provider_status(status)
 
-    # Design mode has its own banner, so only show code council banner for regular mode
-    if not args.design:
-        print(f"\n{'='*60}")
-        print("CREWAI COUNCIL (Dual-Perspective)")
-        print(f"{'='*60}")
-
-        if args.checkpoint:
-            print("Mode: CHECKPOINT (will pause between stages)")
+    if not all(status.values()):
+        if args.yes:
+            print("\n--yes flag: continuing despite missing providers")
         else:
-            print("Mode: CONTINUOUS (no pauses)")
+            response = input("\nContinue anyway? [y/N]: ")
+            if response.lower() != 'y':
+                print("Aborted.")
+                sys.exit(1)
 
-        print_provider_status(status)
+    print(f"\nTask: {task_description}")
+    print(f"Workspace: {WORKSPACE_DIR}")
+    print(f"\n💬 Live streaming: tail -f {DELIBERATION_LOG} | jq -c")
+    print(f"\nAgents (5 total, 3 models):")
+    print("  PLANNING:")
+    print("    - Architect A (Claude Opus 4.5): Clean architecture design")
+    print("    - Architect B (DeepSeek): Performance review")
+    print("  BUILDING:")
+    print("    - Builder (GPT-5.2): Implementation")
+    print("  REVIEW:")
+    print("    - Reviewer A (Claude Opus 4.5): Security & edge cases")
+    print("    - Reviewer B (DeepSeek): Performance & efficiency")
+    print(f"\n{'='*60}\n")
 
-        if not all(status.values()):
-            if args.yes:
-                print("\n--yes flag: continuing despite missing providers")
-            else:
-                response = input("\nContinue anyway? [y/N]: ")
-                if response.lower() != 'y':
-                    print("Aborted.")
-                    sys.exit(1)
-
-        print(f"\nTask: {task_description}")
-        print(f"Workspace: {WORKSPACE_DIR}")
-        print(f"\n💬 Live streaming: tail -f {DELIBERATION_LOG} | jq -c")
-        print(f"\nAgents (5 total, 3 models):")
-        print("  PLANNING:")
-        print("    - Architect A (Claude Opus 4.5): Clean architecture design")
-        print("    - Architect B (DeepSeek): Performance review")
-        print("  BUILDING:")
-        print("    - Builder (GPT-5.2): Implementation")
-        print("  REVIEW:")
-        print("    - Reviewer A (Claude Opus 4.5): Security & edge cases")
-        print("    - Reviewer B (DeepSeek): Performance & efficiency")
-        print(f"\n{'='*60}\n")
-    else:
-        # Design mode - minimal provider check output
-        print_provider_status(status)
-
-        if not all(status.values()):
-            if args.yes:
-                print("\n--yes flag: continuing despite missing providers")
-            else:
-                response = input("\nContinue anyway? [y/N]: ")
-                if response.lower() != 'y':
-                    print("Aborted.")
-                    sys.exit(1)
-
-    # Route to appropriate execution mode
-    if args.design:
-        result = run_design_mode(task_description, use_checkpoints=args.checkpoint)
-    elif args.checkpoint:
+    # Run with or without checkpoints
+    if args.checkpoint:
         result = run_with_checkpoints(task_description)
     else:
         crew = create_crew(task_description)
