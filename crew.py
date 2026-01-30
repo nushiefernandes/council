@@ -30,6 +30,7 @@ import shutil
 import fcntl
 import tempfile
 import atexit
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel
@@ -39,6 +40,87 @@ from crewai.tools import tool
 # Workspace for generated files
 WORKSPACE_DIR = Path.home() / ".council" / "crewai-council" / "workspace"
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Add workspace to Python path for skill_system imports
+sys.path.insert(0, str(WORKSPACE_DIR))
+
+
+# =============================================================================
+# DELIBERATION STREAMING
+# =============================================================================
+
+DELIBERATION_LOG = WORKSPACE_DIR / "deliberation.jsonl"
+
+
+def log_deliberation(agent_role: str, event: str, content: str, **metadata):
+    """
+    Log a deliberation event to JSON lines file for real-time streaming.
+
+    Events can be monitored with: tail -f workspace/deliberation.jsonl | jq -c
+
+    Args:
+        agent_role: Name of the agent (e.g., "Software Architect (Claude)")
+        event: Event type (e.g., "task_start", "step", "task_complete", "checkpoint")
+        content: Event content/output (truncated to 1000 chars)
+        **metadata: Additional fields to include in the log entry
+    """
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "agent": agent_role,
+        "event": event,
+        "content": content[:1000] if content else "",
+        **metadata
+    }
+    try:
+        with open(DELIBERATION_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        # Don't let logging failures break the main flow
+        print(f"Warning: Failed to log deliberation event: {e}", file=sys.stderr)
+
+
+def agent_step_callback(step_output):
+    """
+    Callback fired on each agent step for streaming.
+
+    CrewAI calls this after each agent action, allowing real-time
+    visibility into the deliberation process.
+    """
+    try:
+        # Extract agent role from step output
+        agent_role = getattr(step_output, 'agent', None)
+        if hasattr(agent_role, 'role'):
+            agent_role = agent_role.role
+        else:
+            agent_role = str(agent_role) if agent_role else "Unknown"
+
+        # Extract output content
+        output = getattr(step_output, 'output', None)
+        content = str(output)[:500] if output else ""
+
+        log_deliberation(
+            agent_role=agent_role,
+            event="step",
+            content=content,
+            step=getattr(step_output, 'step', None),
+            thought=getattr(step_output, 'thought', None)[:200] if hasattr(step_output, 'thought') and step_output.thought else None
+        )
+    except Exception as e:
+        # Don't let callback errors break execution
+        print(f"Warning: Step callback error: {e}", file=sys.stderr)
+
+
+def clear_deliberation_log():
+    """Clear the deliberation log at the start of a new session."""
+    try:
+        DELIBERATION_LOG.unlink(missing_ok=True)
+        log_deliberation(
+            agent_role="system",
+            event="session_start",
+            content="New council session started"
+        )
+    except Exception as e:
+        print(f"Warning: Could not clear deliberation log: {e}", file=sys.stderr)
 
 
 # =============================================================================
@@ -306,6 +388,112 @@ def query_skill(skill_name: str, query: str) -> str:
 
 
 # =============================================================================
+# SKILL DISCOVERY: Search and install skills from GitHub
+# =============================================================================
+
+# Trusted sources that auto-approve skill installation
+TRUSTED_SKILL_SOURCES = {"anthropics", "claude-skills-official"}
+
+
+@tool("discover_skill")
+def discover_skill_tool(query: str) -> str:
+    """
+    Search GitHub for Claude Code skills matching a query.
+
+    Searches repositories with the 'claude-skill' topic. Returns skill info
+    including name, description, author, stars, and trust status.
+
+    Trusted sources (auto-approve): anthropics, claude-skills-official
+    Community sources require explicit approval to install.
+
+    Args:
+        query: Search query (e.g., "postgres", "react", "testing")
+
+    Returns:
+        List of matching skills with metadata, or error message
+    """
+    try:
+        from skill_system import discover_skill
+        from skill_system.core import DiscoveryError
+
+        skills = discover_skill(query, limit=10)
+
+        if not skills:
+            return f"No skills found for query '{query}'. Try a different search term."
+
+        result = f"Found {len(skills)} skills for '{query}':\n\n"
+        for i, skill in enumerate(skills, 1):
+            trust_badge = "[TRUSTED]" if skill.is_trusted else "[community]"
+            result += f"{i}. {skill.name} {trust_badge}\n"
+            result += f"   Author: {skill.author} | Stars: {skill.stars}\n"
+            result += f"   {skill.description[:100]}{'...' if len(skill.description) > 100 else ''}\n"
+            result += f"   URL: {skill.repo_url}\n\n"
+
+        result += "\nTo install a skill, use install_skill with the skill name and download URL."
+        return result
+
+    except ImportError as e:
+        return f"Error: skill_system module not available ({e})"
+    except Exception as e:
+        return f"Error searching for skills: {e}"
+
+
+@tool("install_skill")
+def install_skill_tool(skill_name: str, download_url: str, source_owner: str, approve: bool = False) -> str:
+    """
+    Install a Claude Code skill from GitHub.
+
+    Downloads the skill package, verifies security (size limits, blocked extensions,
+    path traversal), and installs to ~/.claude/skills/.
+
+    SECURITY:
+    - Trusted sources (anthropics, claude-skills-official): auto-approved
+    - Community sources: require approve=True parameter
+    - Max package size: 5MB
+    - Blocked extensions: .exe, .sh, .bat, .dll, .so, .dylib
+
+    Args:
+        skill_name: Name to register the skill under
+        download_url: URL to the skill zip file (use repo_url + /archive/refs/heads/main.zip)
+        source_owner: GitHub username/org that owns the repo
+        approve: Set to True to approve community skill installation
+
+    Returns:
+        Installation result with success/failure and details
+    """
+    try:
+        from skill_system import install_skill
+        from skill_system.core import SecurityError, InstallError
+
+        # Check if source is trusted
+        is_trusted = source_owner.lower() in {s.lower() for s in TRUSTED_SKILL_SOURCES}
+
+        if not is_trusted and not approve:
+            return (
+                f"Security: '{source_owner}' is not a trusted source.\n"
+                f"Community skills require explicit approval.\n"
+                f"Call install_skill with approve=True to proceed, or use a skill from a trusted source."
+            )
+
+        result = install_skill(
+            name=skill_name,
+            download_url=download_url,
+            source_owner=source_owner,
+            human_approved=approve,
+        )
+
+        if result.success:
+            return f"✓ Successfully installed skill '{result.skill_name}' to {result.install_path}"
+        else:
+            return f"✗ Failed to install skill: {result.message}"
+
+    except ImportError as e:
+        return f"Error: skill_system module not available ({e})"
+    except Exception as e:
+        return f"Error installing skill: {e}"
+
+
+# =============================================================================
 # PHASE 2: Provider Status Check
 # =============================================================================
 
@@ -377,6 +565,14 @@ def checkpoint(stage: str, summary: str) -> bool:
     Returns:
         True if user approves, False otherwise (exits on abort)
     """
+    # Log checkpoint event
+    log_deliberation(
+        agent_role="system",
+        event="checkpoint",
+        content=summary[:500],
+        stage=stage
+    )
+
     print(f"\n{'='*60}")
     print(f"CHECKPOINT: {stage} COMPLETE")
     print(f"{'='*60}")
@@ -386,14 +582,32 @@ def checkpoint(stage: str, summary: str) -> bool:
         try:
             response = input("\n[A]pprove and continue, [R]eject and abort? [A/r]: ").strip().lower()
             if response in ('', 'a', 'approve', 'yes', 'y'):
+                log_deliberation(
+                    agent_role="system",
+                    event="checkpoint_approved",
+                    content=f"Stage {stage} approved by user",
+                    stage=stage
+                )
                 print("✓ Approved. Continuing to next stage...")
                 return True
             elif response in ('r', 'reject', 'no', 'n', 'abort'):
+                log_deliberation(
+                    agent_role="system",
+                    event="checkpoint_rejected",
+                    content=f"Stage {stage} rejected by user",
+                    stage=stage
+                )
                 print("✗ Rejected. Aborting session.")
                 sys.exit(0)
             else:
                 print("Please enter 'A' to approve or 'R' to reject.")
         except (EOFError, KeyboardInterrupt):
+            log_deliberation(
+                agent_role="system",
+                event="session_interrupted",
+                content=f"Session interrupted during {stage} checkpoint",
+                stage=stage
+            )
             print("\n✗ Session interrupted. Aborting.")
             sys.exit(0)
 
@@ -409,10 +623,13 @@ def create_agents():
         goal="Design clean, maintainable system architecture and make key technical decisions",
         backstory="""You are a senior software architect with 15+ years of experience.
         You focus on clean architecture, separation of concerns, and pragmatic design decisions.
-        You prefer simple solutions that are easy to understand and maintain.""",
+        You prefer simple solutions that are easy to understand and maintain.
+        Use discover_skill to find relevant skills/best practices for the task domain.""",
         llm="anthropic/claude-opus-4-5-20251101",
+        tools=[discover_skill_tool],
         verbose=True,
-        allow_delegation=False
+        allow_delegation=False,
+        step_callback=agent_step_callback
     )
 
     # DeepSeek - focuses on performance and scalability
@@ -424,7 +641,8 @@ def create_agents():
         You ensure the architecture will perform well under load.""",
         llm=LLM(model="ollama/deepseek-coder-v2:16b", base_url="http://localhost:11434"),
         verbose=True,
-        allow_delegation=False
+        allow_delegation=False,
+        step_callback=agent_step_callback
     )
 
     # === BUILDER ===
@@ -440,7 +658,8 @@ def create_agents():
         llm="openai/gpt-5.2",
         tools=[write_file],
         verbose=True,
-        allow_delegation=False
+        allow_delegation=False,
+        step_callback=agent_step_callback
     )
 
     # === REVIEWERS (Dual Perspective) ===
@@ -452,11 +671,12 @@ def create_agents():
         backstory="""You are a security-focused code reviewer who catches subtle bugs.
         You focus on security vulnerabilities, error handling, and edge cases.
         You provide specific, actionable feedback with code examples.
-        Use query_skill to check best practices when reviewing.""",
+        Use query_skill to check best practices and discover_skill to find relevant skills.""",
         llm="anthropic/claude-opus-4-5-20251101",
-        tools=[query_skill],
+        tools=[query_skill, discover_skill_tool],
         verbose=True,
-        allow_delegation=False
+        allow_delegation=False,
+        step_callback=agent_step_callback
     )
 
     # DeepSeek - focuses on performance and efficiency
@@ -466,11 +686,12 @@ def create_agents():
         backstory="""You are a performance-focused code reviewer.
         You identify slow algorithms, memory issues, and optimization opportunities.
         You suggest concrete performance improvements with benchmarks when possible.
-        Use query_skill to check postgres/react best practices when relevant.""",
+        Use query_skill for best practices and discover_skill to find relevant skills.""",
         llm=LLM(model="ollama/deepseek-coder-v2:16b", base_url="http://localhost:11434"),
-        tools=[query_skill],
+        tools=[query_skill, discover_skill_tool],
         verbose=True,
-        allow_delegation=False
+        allow_delegation=False,
+        step_callback=agent_step_callback
     )
 
     return architect_claude, architect_deepseek, builder, reviewer_claude, reviewer_deepseek
@@ -628,6 +849,12 @@ def run_with_checkpoints(task_description: str):
     architect_claude, architect_deepseek, builder, reviewer_claude, reviewer_deepseek = create_agents()
 
     # === STAGE 1: PLANNING ===
+    log_deliberation(
+        agent_role="system",
+        event="stage_start",
+        content="Starting planning phase with Claude and DeepSeek architects",
+        stage="PLANNING"
+    )
     print(f"\n{'='*60}")
     print("STAGE 1: PLANNING")
     print(f"{'='*60}\n")
@@ -691,6 +918,12 @@ Enhance the architecture with performance considerations.""",
     )
 
     # === STAGE 2: BUILDING ===
+    log_deliberation(
+        agent_role="system",
+        event="stage_start",
+        content="Starting building phase with GPT-5.2 builder",
+        stage="BUILDING"
+    )
     print(f"\n{'='*60}")
     print("STAGE 2: BUILDING")
     print(f"{'='*60}\n")
@@ -740,6 +973,12 @@ For each file, call write_file(filename="path/to/file.py", content="...code...")
     )
 
     # === STAGE 3: REVIEW ===
+    log_deliberation(
+        agent_role="system",
+        event="stage_start",
+        content="Starting review phase with Claude (security) and DeepSeek (performance) reviewers",
+        stage="REVIEW"
+    )
     print(f"\n{'='*60}")
     print("STAGE 3: REVIEW")
     print(f"{'='*60}\n")
@@ -849,6 +1088,15 @@ Examples:
         print("Error: Task description cannot be empty")
         sys.exit(1)
 
+    # Initialize deliberation log for this session
+    clear_deliberation_log()
+    log_deliberation(
+        agent_role="system",
+        event="task_received",
+        content=task_description,
+        mode="checkpoint" if args.checkpoint else "continuous"
+    )
+
     print(f"\n{'='*60}")
     print("CREWAI COUNCIL (Dual-Perspective)")
     print(f"{'='*60}")
@@ -877,6 +1125,7 @@ Examples:
 
     print(f"\nTask: {task_description}")
     print(f"Workspace: {WORKSPACE_DIR}")
+    print(f"\n💬 Live streaming: tail -f {DELIBERATION_LOG} | jq -c")
     print(f"\nAgents (5 total, 3 models):")
     print("  PLANNING:")
     print("    - Architect A (Claude Opus 4.5): Clean architecture design")
@@ -895,10 +1144,18 @@ Examples:
         crew = create_crew(task_description)
         result = crew.kickoff()
 
+    # Log session complete
+    log_deliberation(
+        agent_role="system",
+        event="session_complete",
+        content=str(result)[:500]
+    )
+
     print(f"\n{'='*60}")
     print("FINAL RESULT")
     print(f"{'='*60}")
     print(result)
+    print(f"\n📜 Deliberation log: {DELIBERATION_LOG}")
 
     return result
 
