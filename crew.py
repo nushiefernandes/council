@@ -321,57 +321,132 @@ def write_file(filename: str, content: str) -> str:
 # =============================================================================
 
 SKILLS_DIR = Path.home() / ".claude" / "skills"
-ALLOWED_SKILLS = {
-    "postgres-best-practices",
-    "react-best-practices",
-    "web-design-guidelines",
-}
+
+
+def find_skill(skill_name: str) -> Path | None:
+    """
+    Find a skill by name across all skill locations.
+    Returns path to SKILL.md or AGENTS.md, or None if not found.
+    Priority: ~/.claude/skills/ > claude-code-plugins > claude-plugins-official
+    """
+    SKILLS_LOCATIONS = [
+        (Path.home() / ".claude" / "skills", "direct"),
+        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-code-plugins" / "plugins", "nested"),
+        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-plugins-official" / "plugins", "nested"),
+    ]
+
+    for base_path, structure in SKILLS_LOCATIONS:
+        if not base_path.exists():
+            continue
+
+        if structure == "direct":
+            skill_dir = base_path / skill_name
+        else:
+            skill_dir = base_path / skill_name / "skills" / skill_name
+
+        for filename in ["AGENTS.md", "SKILL.md"]:
+            skill_file = skill_dir / filename
+            if skill_file.exists():
+                return skill_file
+
+    return None
+
+
+def extract_description(skill_file: Path, max_length: int = 100) -> str:
+    """Extract description from skill file frontmatter or first paragraph."""
+    try:
+        content = skill_file.read_text()
+
+        if content.startswith("---"):
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                for line in parts[1].split("\n"):
+                    if line.startswith("description:"):
+                        desc = line.replace("description:", "").strip().strip('"\'')
+                        return desc[:max_length] + ("..." if len(desc) > max_length else "")
+
+        for line in content.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#") and not line.startswith("---"):
+                return line[:max_length] + ("..." if len(line) > max_length else "")
+
+        return "No description available"
+    except Exception:
+        return "No description available"
+
+
+@tool("list_skills")
+def list_skills_tool() -> str:
+    """
+    List all available skills that can be queried.
+    Returns skill names with brief descriptions.
+    """
+    SKILLS_LOCATIONS = [
+        (Path.home() / ".claude" / "skills", "direct"),
+        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-code-plugins" / "plugins", "nested"),
+        (Path.home() / ".claude" / "plugins" / "marketplaces" / "claude-plugins-official" / "plugins", "nested"),
+    ]
+
+    skills = []
+    seen_names = set()
+
+    for base_path, structure in SKILLS_LOCATIONS:
+        if not base_path.exists():
+            continue
+
+        try:
+            for item in sorted(base_path.iterdir()):
+                if not item.is_dir() or item.name.startswith("."):
+                    continue
+
+                skill_name = item.name
+                if skill_name in seen_names:
+                    continue
+
+                skill_file = find_skill(skill_name)
+                if not skill_file:
+                    continue
+
+                description = extract_description(skill_file)
+                skills.append(f"  - {skill_name}: {description}")
+                seen_names.add(skill_name)
+
+        except PermissionError:
+            continue
+
+    if not skills:
+        return "No skills found. Check ~/.claude/skills/ directory."
+
+    header = f"Available skills ({len(skills)}):\n"
+
+    if len(skills) > 25:
+        return header + "\n".join(skills[:25]) + f"\n  ... and {len(skills) - 25} more"
+
+    return header + "\n".join(skills)
 
 
 @tool("query_skill")
 def query_skill(skill_name: str, query: str) -> str:
     """
-    Query a Claude Code skill for best practices and guidelines.
-
-    Use this to get expert guidance on specific topics. Available skills:
-    - postgres-best-practices: Database optimization, indexes, queries
-    - react-best-practices: React/Next.js patterns, performance, hooks
-    - web-design-guidelines: UI/UX, accessibility, design systems
-
-    Args:
-        skill_name: One of the available skill names listed above
-        query: What you want to look up (e.g., "index optimization", "React hooks")
-
-    Returns:
-        Relevant guidance from the skill documentation
+    Query a skill for relevant guidance.
+    Use list_skills first to see available skills.
     """
-    if skill_name not in ALLOWED_SKILLS:
-        return f"Error: Unknown skill '{skill_name}'. Available: {', '.join(ALLOWED_SKILLS)}"
+    skill_file = find_skill(skill_name)
 
-    skill_path = SKILLS_DIR / skill_name
+    if not skill_file:
+        return f"Error: Skill '{skill_name}' not found. Run list_skills to see available skills."
 
-    if not skill_path.exists():
-        return f"Error: Skill '{skill_name}' not found at {skill_path}"
-
-    # Try to read AGENTS.md first (compiled for agents), then SKILL.md
-    agents_file = skill_path / "AGENTS.md"
-    skill_file = skill_path / "SKILL.md"
-
-    if agents_file.exists():
-        content = agents_file.read_text()
-    elif skill_file.exists():
+    try:
         content = skill_file.read_text()
-    else:
-        return f"Error: No readable content in skill '{skill_name}'"
+    except Exception as e:
+        return f"Error reading skill '{skill_name}': {e}"
 
-    # Simple keyword search - return matching lines
     query_lower = query.lower()
     lines = content.split('\n')
     relevant = []
 
     for i, line in enumerate(lines):
         if query_lower in line.lower():
-            # Include surrounding context (2 lines before/after)
             start = max(0, i - 2)
             end = min(len(lines), i + 3)
             context = '\n'.join(lines[start:end])
@@ -380,11 +455,12 @@ def query_skill(skill_name: str, query: str) -> str:
 
     if relevant:
         result = f"From {skill_name} (query: '{query}'):\n\n"
-        result += "\n---\n".join(relevant[:5])  # Limit to 5 matches
+        result += "\n---\n".join(relevant[:5])
+        if len(result) > 4000:
+            result = result[:4000] + "\n... (truncated)"
         return result
     else:
-        # Return a summary of the skill if no matches
-        return f"No matches for '{query}' in {skill_name}. Skill contains {len(lines)} lines of guidance on {skill_name.replace('-', ' ')}."
+        return f"No matches for '{query}' in {skill_name}. Try a different query or run list_skills to find other skills."
 
 
 # =============================================================================
@@ -673,7 +749,7 @@ def create_agents():
         You provide specific, actionable feedback with code examples.
         Use query_skill to check best practices and discover_skill to find relevant skills.""",
         llm="anthropic/claude-opus-4-5-20251101",
-        tools=[query_skill, discover_skill_tool],
+        tools=[list_skills_tool, query_skill, discover_skill_tool],
         verbose=True,
         allow_delegation=False,
         step_callback=agent_step_callback
@@ -688,7 +764,7 @@ def create_agents():
         You suggest concrete performance improvements with benchmarks when possible.
         Use query_skill for best practices and discover_skill to find relevant skills.""",
         llm=LLM(model="ollama/deepseek-coder-v2:16b", base_url="http://localhost:11434"),
-        tools=[query_skill, discover_skill_tool],
+        tools=[list_skills_tool, query_skill, discover_skill_tool],
         verbose=True,
         allow_delegation=False,
         step_callback=agent_step_callback

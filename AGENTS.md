@@ -65,6 +65,18 @@ tail -f ~/.council/crewai-council/workspace/deliberation.jsonl | jq -c
 
 **Note**: Builder writes files directly - no manual copy needed after completion.
 
+## Skill Tools
+
+Agents can access Claude Code skills for domain expertise:
+
+| Tool | Purpose |
+|------|---------|
+| `list_skills` | See all available skills (run first) |
+| `query_skill(name, query)` | Search a skill for guidance |
+| `discover_skill(query)` | Search GitHub for new skills |
+
+Skills are auto-discovered from ~/.claude/skills/ and installed plugins.
+
 ## Output Locations
 
 - **Console**: Full deliberation from all 5 agents
