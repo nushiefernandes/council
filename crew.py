@@ -51,6 +51,53 @@ sys.path.insert(0, str(WORKSPACE_DIR))
 
 DELIBERATION_LOG = WORKSPACE_DIR / "deliberation.jsonl"
 
+# Rich streaming infrastructure (imported lazily to avoid import errors)
+_event_bus = None
+_adapter = None
+
+
+def init_streaming(rich: bool = True):
+    """
+    Initialize the rich streaming system with terminal and file handlers.
+
+    Args:
+        rich: Enable rich terminal output with emojis and colors
+
+    Returns:
+        CrewAIStreamAdapter for emitting events
+    """
+    global _event_bus, _adapter
+
+    try:
+        from streaming.bus import StreamEventBus
+        from streaming.adapter import CrewAIStreamAdapter
+        from streaming.handlers import TerminalHandler, FileHandler
+
+        _event_bus = StreamEventBus()
+
+        if rich:
+            _event_bus.register(TerminalHandler(use_rich=True))
+
+        _event_bus.register(FileHandler(DELIBERATION_LOG))
+        _adapter = CrewAIStreamAdapter(_event_bus)
+        _event_bus.start()
+
+        return _adapter
+    except ImportError as e:
+        print(f"Warning: Rich streaming not available ({e}). Using basic output.", file=sys.stderr)
+        return None
+
+
+def cleanup_streaming():
+    """Clean up streaming resources."""
+    global _event_bus
+    if _event_bus:
+        try:
+            _event_bus.stop()
+        except Exception as e:
+            print(f"Warning: Error stopping stream: {e}", file=sys.stderr)
+        _event_bus = None
+
 
 def log_deliberation(agent_role: str, event: str, content: str, **metadata):
     """
@@ -86,6 +133,11 @@ def agent_step_callback(step_output):
     CrewAI calls this after each agent action, allowing real-time
     visibility into the deliberation process.
     """
+    # Delegate to rich streaming adapter if available
+    if _adapter:
+        _adapter.step_callback(step_output)
+
+    # Also log to JSONL for backward compatibility
     try:
         # Extract agent role from step output
         agent_role = getattr(step_output, 'agent', None)
@@ -931,6 +983,8 @@ def run_with_checkpoints(task_description: str):
         content="Starting planning phase with Claude and DeepSeek architects",
         stage="PLANNING"
     )
+    if _adapter:
+        _adapter.emit_stage_start("Stage 1: Planning", "Claude & DeepSeek designing architecture")
     print(f"\n{'='*60}")
     print("STAGE 1: PLANNING")
     print(f"{'='*60}\n")
@@ -1000,6 +1054,8 @@ Enhance the architecture with performance considerations.""",
         content="Starting building phase with GPT-5.2 builder",
         stage="BUILDING"
     )
+    if _adapter:
+        _adapter.emit_stage_start("Stage 2: Building", "GPT-5.2 implementing solution")
     print(f"\n{'='*60}")
     print("STAGE 2: BUILDING")
     print(f"{'='*60}\n")
@@ -1055,6 +1111,8 @@ For each file, call write_file(filename="path/to/file.py", content="...code...")
         content="Starting review phase with Claude (security) and DeepSeek (performance) reviewers",
         stage="REVIEW"
     )
+    if _adapter:
+        _adapter.emit_stage_start("Stage 3: Review", "Claude & DeepSeek reviewing code")
     print(f"\n{'='*60}")
     print("STAGE 3: REVIEW")
     print(f"{'='*60}\n")
@@ -1151,6 +1209,23 @@ Examples:
         action="store_true",
         help="Skip Ollama auto-start (use if you don't have DeepSeek)"
     )
+    parser.add_argument(
+        "--rich",
+        action="store_true",
+        default=True,
+        help="Enable rich terminal output with emojis and colors (default: on)"
+    )
+    parser.add_argument(
+        "--no-rich",
+        dest="rich",
+        action="store_false",
+        help="Disable rich terminal output"
+    )
+    parser.add_argument(
+        "--design",
+        action="store_true",
+        help="Run in design mode - generates UI mockups and design options"
+    )
 
     args = parser.parse_args()
 
@@ -1164,6 +1239,10 @@ Examples:
         print("Error: Task description cannot be empty")
         sys.exit(1)
 
+    # Initialize rich streaming (if available)
+    adapter = init_streaming(rich=args.rich)
+    atexit.register(cleanup_streaming)
+
     # Initialize deliberation log for this session
     clear_deliberation_log()
     log_deliberation(
@@ -1172,6 +1251,13 @@ Examples:
         content=task_description,
         mode="checkpoint" if args.checkpoint else "continuous"
     )
+
+    # Emit session start via rich streaming
+    if adapter:
+        adapter.emit_session_start(
+            task_description,
+            mode="checkpoint" if args.checkpoint else "continuous"
+        )
 
     print(f"\n{'='*60}")
     print("CREWAI COUNCIL (Dual-Perspective)")
@@ -1202,23 +1288,59 @@ Examples:
     print(f"\nTask: {task_description}")
     print(f"Workspace: {WORKSPACE_DIR}")
     print(f"\n💬 Live streaming: tail -f {DELIBERATION_LOG} | jq -c")
-    print(f"\nAgents (5 total, 3 models):")
-    print("  PLANNING:")
-    print("    - Architect A (Claude Opus 4.5): Clean architecture design")
-    print("    - Architect B (DeepSeek): Performance review")
-    print("  BUILDING:")
-    print("    - Builder (GPT-5.2): Implementation")
-    print("  REVIEW:")
-    print("    - Reviewer A (Claude Opus 4.5): Security & edge cases")
-    print("    - Reviewer B (DeepSeek): Performance & efficiency")
-    print(f"\n{'='*60}\n")
 
-    # Run with or without checkpoints
-    if args.checkpoint:
-        result = run_with_checkpoints(task_description)
+    # Design mode uses different pipeline
+    if args.design:
+        print(f"\nAgents (4 total, 3 models) - DESIGN MODE:")
+        print("  UX ANALYSIS:")
+        print("    - UX Designer (Claude Opus 4.5): User flows, interaction patterns")
+        print("  VISUAL DESIGN:")
+        print("    - Visual Designer (GPT-5.2): 2-3 distinct mockups")
+        print("  TECHNICAL REVIEW:")
+        print("    - Technical Designer (DeepSeek): Feasibility, performance")
+        print("  SYNTHESIS:")
+        print("    - Synthesizer (Claude Opus 4.5): DESIGN-BRIEF.md")
+        print(f"\n{'='*60}\n")
+
+        from design_mode.cli import run_design_mode, DesignArgs
+        result = run_design_mode(DesignArgs(
+            task=task_description,
+            workspace=str(WORKSPACE_DIR),
+            checkpoint=args.checkpoint,
+            verbose=True
+        ))
+
+        # Show design outputs
+        design_dir = WORKSPACE_DIR / "design"
+        if design_dir.exists():
+            print(f"\n{'='*60}")
+            print("DESIGN OUTPUT")
+            print(f"{'='*60}")
+            for f in sorted(design_dir.glob("*")):
+                print(f"  - {f.name}")
+            print(f"\nOpen HTML files in browser to view mockups.")
+            print(f"Read DESIGN-BRIEF.md for synthesis and recommendations.")
     else:
-        crew = create_crew(task_description)
-        result = crew.kickoff()
+        print(f"\nAgents (5 total, 3 models):")
+        print("  PLANNING:")
+        print("    - Architect A (Claude Opus 4.5): Clean architecture design")
+        print("    - Architect B (DeepSeek): Performance review")
+        print("  BUILDING:")
+        print("    - Builder (GPT-5.2): Implementation")
+        print("  REVIEW:")
+        print("    - Reviewer A (Claude Opus 4.5): Security & edge cases")
+        print("    - Reviewer B (DeepSeek): Performance & efficiency")
+        print(f"\n{'='*60}\n")
+
+        # Run with or without checkpoints
+        if args.checkpoint:
+            result = run_with_checkpoints(task_description)
+        else:
+            # Emit stage start for continuous mode
+            if _adapter:
+                _adapter.emit_stage_start("Council Deliberation", "5 agents across 3 stages")
+            crew = create_crew(task_description)
+            result = crew.kickoff()
 
     # Log session complete
     log_deliberation(
@@ -1226,6 +1348,11 @@ Examples:
         event="session_complete",
         content=str(result)[:500]
     )
+
+    # Emit session complete via rich streaming
+    if _adapter:
+        _adapter.emit_session_complete(str(result)[:500])
+    cleanup_streaming()
 
     print(f"\n{'='*60}")
     print("FINAL RESULT")
